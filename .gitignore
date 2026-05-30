@@ -56,6 +56,7 @@ notes.zip
 
 # Sensitive files
 git.txt
+github_token.txt
 notes.json
 
 # macOS build
