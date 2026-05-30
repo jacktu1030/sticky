@@ -1,0 +1,66 @@
+# Flutter SDK & Build Tools
+flutter/
+jdk-17.0.12+7/
+android-sdk/
+cmdline-tools.zip
+flutter.zip
+gradle-7.6.3-all.zip
+openjdk.zip
+
+# Build outputs
+build/
+dist/
+output/
+work/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Dart/Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+
+# Claude
+.claude/
+
+# Temporary files
+*.tmp
+*.log
+
+# Verification images (generated)
+calendar_dot_verify.png
+clock_verify.png
+
+# Temporary scripts
+analyze_root_cause.ps1
+check_usb.ps1
+fix_umdf_timeout.ps1
+
+# Archives
+notes.zip
+
+# Android build artifacts
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Sensitive files
+git.txt
+notes.json
+
+# macOS build
+yuran_calendar_macos/
+
+# Symbolication
+app.*.symbols
+app.*.map.json

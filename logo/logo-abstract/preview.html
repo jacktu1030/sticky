@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Abstract Logo Preview</title>
+  <style>
+    :root {
+      --paper: #fbf6ed;
+      --ink: #142b31;
+      --sand: #f0d7a3;
+      --line: #d8c8b0;
+      --muted: #6e7b7f;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #fff7ea 0, rgba(255, 247, 234, 0) 32%),
+        radial-gradient(circle at bottom right, #d8efe7 0, rgba(216, 239, 231, 0) 36%),
+        #f4efe6;
+    }
+
+    main {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 48px 28px 64px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(28px, 5vw, 48px);
+      letter-spacing: -0.04em;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .grid {
+      display: grid;
+      gap: 22px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      margin-top: 34px;
+    }
+
+    .card {
+      padding: 22px;
+      border-radius: 28px;
+      background: rgba(255, 255, 255, 0.74);
+      border: 1px solid rgba(20, 43, 49, 0.08);
+      box-shadow: 0 20px 60px rgba(20, 43, 49, 0.08);
+      backdrop-filter: blur(10px);
+    }
+
+    .tile {
+      display: grid;
+      place-items: center;
+      min-height: 320px;
+      border-radius: 24px;
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(249, 244, 235, 0.8)),
+        #fff;
+    }
+
+    .tile.dark {
+      background:
+        radial-gradient(circle at top, rgba(88, 163, 145, 0.18), transparent 36%),
+        #12292f;
+      border-color: rgba(255, 255, 255, 0.08);
+    }
+
+    img {
+      width: min(78%, 320px);
+      height: auto;
+      display: block;
+    }
+
+    h2 {
+      margin: 18px 0 8px;
+      font-size: 20px;
+      letter-spacing: -0.03em;
+    }
+
+    .tag {
+      display: inline-block;
+      margin-top: 12px;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: #efe6d8;
+      color: #6e593d;
+      font-size: 13px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>抽象 Logo 方向</h1>
+    <p>这次弱化了“闹钟/时钟”的直译感，改成更适合品牌化的抽象几何。三个方向都保留了一点“日程、卡片、折页、组织感”的影子，但不再把功能直接画出来。</p>
+    <div class="grid">
+      <section class="card">
+        <div class="tile dark">
+          <img src="./fold-loop.svg" alt="Fold Loop">
+        </div>
+        <h2>Fold Loop</h2>
+        <p>最均衡的一版。外轮廓稳，内圈是连续规划感，右下折角保留便签影子，但整体已经偏品牌符号。</p>
+        <span class="tag">推荐继续细化</span>
+      </section>
+      <section class="card">
+        <div class="tile">
+          <img src="./binder-fold.svg" alt="Binder Fold">
+        </div>
+        <h2>Binder Fold</h2>
+        <p>更像轻量效率工具，保留一点日历装订感，但内部改成抽象折带，不再出现时钟图形。</p>
+        <span class="tag">更偏产品气质</span>
+      </section>
+      <section class="card">
+        <div class="tile">
+          <img src="./stack-sync.svg" alt="Stack Sync">
+        </div>
+        <h2>Stack Sync</h2>
+        <p>层叠卡片的方向，强调多视图、多设备、便签与日程之间的同步关系，最抽象也最像品牌标。</p>
+        <span class="tag">更抽象前卫</span>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,24 @@
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/transparent">
+
+    <ImageView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:adjustViewBounds="true"
+        android:contentDescription="@string/widget_clock_analog"
+        android:padding="8dp"
+        android:scaleType="fitCenter"
+        android:src="@drawable/widget_analog_preview" />
+
+    <ImageView
+        android:id="@+id/widget_clock_image"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:adjustViewBounds="true"
+        android:contentDescription="@string/widget_clock_analog"
+        android:padding="4dp"
+        android:scaleType="fitCenter" />
+</FrameLayout>

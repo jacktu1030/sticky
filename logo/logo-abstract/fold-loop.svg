@@ -1,0 +1,9 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Fold Loop</title>
+  <rect x="112" y="112" width="800" height="800" rx="224" fill="#17353B"/>
+  <path d="M260 180H746C812 180 860 228 860 294V618C860 654 845 688 819 713L715 817C690 842 656 856 620 856H260C194 856 146 808 146 742V294C146 228 194 180 260 180Z" fill="#FFF8ED"/>
+  <path d="M676 676C676 633 710 598 754 598H860L676 782V676Z" fill="#F1C76A"/>
+  <path d="M676 782L860 598V742C860 805 809 856 746 856H602L676 782Z" fill="#E46C4E"/>
+  <path d="M332 390C332 330 381 282 441 282H585C649 282 698 331 698 395C698 456 649 506 588 506H470C420 506 382 544 382 594C382 644 420 682 470 682H614C674 682 722 634 722 574" stroke="#58A391" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="722" cy="574" r="34" fill="#E46C4E"/>
+</svg>
