@@ -1,8 +1,10 @@
 import tkinter as tk
 from tkinter import messagebox, ttk, colorchooser, simpledialog, filedialog
 import base64
+import hashlib
 import json
 import os
+import secrets
 import sys
 import subprocess
 import threading
@@ -10,10 +12,19 @@ import time
 import ctypes
 from ctypes import wintypes
 import math
+import uuid
 import urllib.parse
 import urllib.request
+from urllib.error import HTTPError, URLError
 from datetime import datetime, timedelta
 from PIL import Image, ImageTk
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CRYPTOGRAPHY_OK = True
+except ImportError:
+    AESGCM = None
+    CRYPTOGRAPHY_OK = False
 
 try:
     import winreg
@@ -39,12 +50,21 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 DATA_FILE = os.path.join(_app_dir(), "notes.json")
+SYNC_CONFIG_FILE = os.path.join(_app_dir(), "sync_config.json")
 ENCRYPTED_DATA_MAGIC = "yuran_calendar_encrypted"
 ENCRYPTED_DATA_VERSION = 1
 ENCRYPTED_DATA_METHOD = "windows-dpapi-current-user"
+SYNC_ENCRYPTED_MAGIC = "yuran_calendar_webdav_sync"
+SYNC_PAYLOAD_MAGIC = "yuran_calendar_sync_payload"
+SYNC_ENCRYPTED_VERSION = 1
+SYNC_ENCRYPTED_METHOD = "pbkdf2-sha256+aes-256-gcm"
+SYNC_KDF_ITERATIONS = 390000
+SYNC_DEFAULT_REMOTE_PATH = "yuran-calendar-sync.json"
+SYNC_AAD = b"yuran-calendar-sync-v1"
 WEATHER_UPDATE_INTERVAL_MS = 30 * 60 * 1000
 WEATHER_RETRY_INTERVAL_MS = 5 * 60 * 1000
 HTTP_TIMEOUT = 10
+SYNC_HTTP_TIMEOUT = 20
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "雨然日历"
 
@@ -487,6 +507,245 @@ def write_data_file(path, data, encrypted=True):
     os.replace(tmp_path, path)
 
 
+def utc_now_iso():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def parse_sync_time(value):
+    if not value:
+        return datetime.min
+    text = str(value).strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return datetime.min
+
+
+def get_data_sync_updated_at(data):
+    if isinstance(data, dict):
+        meta = data.get("_sync_meta")
+        if isinstance(meta, dict):
+            return meta.get("updated_at")
+    return None
+
+
+def make_default_sync_config():
+    return {
+        "enabled": False,
+        "server_url": "",
+        "username": "",
+        "password": "",
+        "remote_path": SYNC_DEFAULT_REMOTE_PATH,
+        "sync_password": "",
+        "auto_sync": False,
+        "device_id": uuid.uuid4().hex,
+        "last_sync_at": "",
+        "last_synced_updated_at": "",
+    }
+
+
+def normalize_sync_config(config):
+    normalized = make_default_sync_config()
+    if isinstance(config, dict):
+        for key in normalized:
+            if key in config:
+                normalized[key] = config[key]
+    normalized["enabled"] = bool(normalized.get("enabled"))
+    normalized["auto_sync"] = bool(normalized.get("auto_sync"))
+    normalized["server_url"] = str(normalized.get("server_url") or "").strip()
+    normalized["username"] = str(normalized.get("username") or "").strip()
+    normalized["password"] = str(normalized.get("password") or "")
+    normalized["remote_path"] = str(normalized.get("remote_path") or SYNC_DEFAULT_REMOTE_PATH).strip() or SYNC_DEFAULT_REMOTE_PATH
+    normalized["sync_password"] = str(normalized.get("sync_password") or "")
+    normalized["device_id"] = str(normalized.get("device_id") or uuid.uuid4().hex)
+    return normalized
+
+
+def derive_sync_key(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        SYNC_KDF_ITERATIONS,
+        dklen=32,
+    )
+
+
+def make_syncable_data(data):
+    cloned = json.loads(json.dumps(data, ensure_ascii=False))
+    if isinstance(cloned, dict):
+        cloned.pop("sync", None)
+    return cloned
+
+
+def encrypt_sync_package(data, password, device_id):
+    if not CRYPTOGRAPHY_OK:
+        raise RuntimeError("缺少 cryptography 依赖，无法使用 WebDAV 加密同步")
+    if not password:
+        raise ValueError("请先设置同步密码")
+
+    sync_data = make_syncable_data(data)
+    updated_at = get_data_sync_updated_at(sync_data) or utc_now_iso()
+    plain_payload = {
+        "magic": SYNC_PAYLOAD_MAGIC,
+        "version": SYNC_ENCRYPTED_VERSION,
+        "updated_at": updated_at,
+        "device_id": device_id,
+        "data": sync_data,
+    }
+    plain = json.dumps(plain_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    key = derive_sync_key(password, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, plain, SYNC_AAD)
+    return {
+        "magic": SYNC_ENCRYPTED_MAGIC,
+        "version": SYNC_ENCRYPTED_VERSION,
+        "encrypted": True,
+        "method": SYNC_ENCRYPTED_METHOD,
+        "kdf": {
+            "name": "PBKDF2-HMAC-SHA256",
+            "iterations": SYNC_KDF_ITERATIONS,
+            "salt": base64.b64encode(salt).decode("ascii"),
+        },
+        "cipher": {
+            "name": "AES-256-GCM",
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+        },
+        "updated_at": updated_at,
+        "device_id": device_id,
+        "payload": base64.b64encode(ciphertext).decode("ascii"),
+    }
+
+
+def decrypt_sync_package(envelope, password):
+    if not CRYPTOGRAPHY_OK:
+        raise RuntimeError("缺少 cryptography 依赖，无法使用 WebDAV 加密同步")
+    if not password:
+        raise ValueError("请先输入同步密码")
+    if not isinstance(envelope, dict) or envelope.get("magic") != SYNC_ENCRYPTED_MAGIC:
+        raise ValueError("云端文件不是雨然日历同步文件")
+    if envelope.get("method") != SYNC_ENCRYPTED_METHOD:
+        raise ValueError("不支持的同步加密方式")
+
+    kdf = envelope.get("kdf") or {}
+    cipher = envelope.get("cipher") or {}
+    iterations = safe_int(kdf.get("iterations"), 0)
+    if iterations <= 0:
+        raise ValueError("同步文件 KDF 参数无效")
+    salt = base64.b64decode(kdf.get("salt", ""))
+    nonce = base64.b64decode(cipher.get("nonce", ""))
+    ciphertext = base64.b64decode(envelope.get("payload", ""))
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
+    plain = AESGCM(key).decrypt(nonce, ciphertext, SYNC_AAD)
+    payload = json.loads(plain.decode("utf-8"))
+    if not isinstance(payload, dict) or payload.get("magic") != SYNC_PAYLOAD_MAGIC:
+        raise ValueError("同步文件内容无效")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("同步数据格式无效")
+    return payload
+
+
+class WebDavError(RuntimeError):
+    pass
+
+
+def _webdav_auth_header(username, password):
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def _webdav_path_segments(path):
+    normalized = str(path or SYNC_DEFAULT_REMOTE_PATH).replace("\\", "/").strip("/")
+    return [segment for segment in normalized.split("/") if segment]
+
+
+def build_webdav_file_url(config, path=None):
+    base_url = str(config.get("server_url") or "").strip()
+    if not base_url.lower().startswith(("http://", "https://")):
+        raise ValueError("WebDAV 地址必须以 http:// 或 https:// 开头")
+    segments = _webdav_path_segments(path or config.get("remote_path") or SYNC_DEFAULT_REMOTE_PATH)
+    if not segments:
+        segments = [SYNC_DEFAULT_REMOTE_PATH]
+    encoded_path = "/".join(urllib.parse.quote(segment) for segment in segments)
+    return f"{base_url.rstrip('/')}/{encoded_path}"
+
+
+def validate_webdav_config(config):
+    if not str(config.get("server_url") or "").strip():
+        raise ValueError("请填写 WebDAV 地址")
+    if not str(config.get("username") or "").strip():
+        raise ValueError("请填写 WebDAV 账号")
+    if not str(config.get("password") or ""):
+        raise ValueError("请填写 WebDAV 应用密码")
+    if not str(config.get("sync_password") or ""):
+        raise ValueError("请填写同步密码")
+    build_webdav_file_url(config)
+
+
+def webdav_request(method, url, config, data=None, headers=None, allowed_statuses=None):
+    allowed_statuses = set(allowed_statuses or (200, 201, 204, 207))
+    request_headers = {
+        "User-Agent": "YuranCalendar/1.0",
+        "Authorization": _webdav_auth_header(config.get("username", ""), config.get("password", "")),
+    }
+    if data is not None:
+        request_headers["Content-Type"] = "application/json; charset=utf-8"
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=SYNC_HTTP_TIMEOUT) as resp:
+            body = resp.read()
+            status = getattr(resp, "status", resp.getcode())
+            return status, body, dict(resp.headers)
+    except HTTPError as e:
+        body = e.read()
+        if e.code in allowed_statuses:
+            return e.code, body, dict(e.headers)
+        raise WebDavError(f"WebDAV 请求失败：HTTP {e.code} {e.reason}")
+    except URLError as e:
+        raise WebDavError(f"WebDAV 连接失败：{e.reason}")
+
+
+def ensure_webdav_parent_dirs(config):
+    segments = _webdav_path_segments(config.get("remote_path") or SYNC_DEFAULT_REMOTE_PATH)
+    if len(segments) <= 1:
+        return
+    base_url = str(config.get("server_url") or "").strip().rstrip("/")
+    current_url = base_url
+    for segment in segments[:-1]:
+        current_url = f"{current_url}/{urllib.parse.quote(segment)}"
+        webdav_request("MKCOL", current_url, config, allowed_statuses=(200, 201, 204, 405))
+
+
+def webdav_upload_sync_package(config, envelope):
+    ensure_webdav_parent_dirs(config)
+    file_url = build_webdav_file_url(config)
+    data = json.dumps(envelope, ensure_ascii=False, indent=2).encode("utf-8")
+    webdav_request("PUT", file_url, config, data=data, allowed_statuses=(200, 201, 204))
+
+
+def webdav_download_sync_package(config):
+    file_url = build_webdav_file_url(config)
+    status, body, headers = webdav_request("GET", file_url, config, allowed_statuses=(200, 404))
+    if status == 404:
+        return None
+    return json.loads(body.decode("utf-8-sig"))
+
+
+def webdav_test_connection(config):
+    validate_webdav_config(config)
+    base_url = str(config.get("server_url") or "").strip().rstrip("/") + "/"
+    webdav_request("PROPFIND", base_url, config, headers={"Depth": "0"}, allowed_statuses=(200, 207))
+
+
 class StickyNote:
     def __init__(self, root):
         self.root = root
@@ -498,6 +757,7 @@ class StickyNote:
         self.data_loaded_from_plaintext = False
 
         self.data = self.load_data()
+        self.sync_config = self.load_sync_config()
         self.current_color = self.data.get("color", "yellow")
         self.custom_colors = self.data.get("custom_colors", {})
         self.reminders = self.data.get("reminders", [])
@@ -549,7 +809,8 @@ class StickyNote:
         self.refresh_weather()
         if self.show_clock:
             self.root.after(200, self.show_floating_clock)
-        self.root.after(1200, self.check_startup_registration)
+        if self.sync_config.get("auto_sync") and self.is_sync_config_ready():
+            self.root.after(2500, lambda: self.sync_now_interactive(show_success=False))
 
         # 写入 pid 文件，供 bat 脚本判断是否已启动
         self._write_pid()
@@ -590,11 +851,35 @@ class StickyNote:
         if sys.platform != "win32" or winreg is None:
             return False
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH) as key:
                 winreg.SetValueEx(key, STARTUP_REG_NAME, 0, winreg.REG_SZ, self.get_startup_command())
             return True
         except OSError:
             return False
+
+    def disable_startup(self):
+        if sys.platform != "win32" or winreg is None:
+            return False
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, STARTUP_REG_NAME)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def toggle_startup(self):
+        if self.is_startup_enabled():
+            if self.disable_startup():
+                messagebox.showinfo("开机自启动", "已关闭开机自启动。", parent=self.root)
+            else:
+                messagebox.showwarning("开机自启动", "关闭失败，请检查系统权限。", parent=self.root)
+        else:
+            if self.enable_startup():
+                messagebox.showinfo("开机自启动", "已开启开机自启动。", parent=self.root)
+            else:
+                messagebox.showwarning("开机自启动", "开启失败，请检查系统权限。", parent=self.root)
 
     def check_startup_registration(self):
         if self.is_startup_enabled():
@@ -657,6 +942,13 @@ class StickyNote:
         self.close_btn.bind("<Button-1>", lambda e: self.on_close())
         self.close_btn.bind("<Enter>", lambda e: self.close_btn.config(fg="#D32F2F"))
         self.close_btn.bind("<Leave>", lambda e: self.close_btn.config(fg="#888888"))
+
+        self.settings_btn = tk.Label(btn_frame, text="设置", bg=theme["bg"], fg=theme["fg"],
+                                     font=("Microsoft YaHei", 9), cursor="hand2", padx=3)
+        self.settings_btn.pack(side=tk.RIGHT, padx=(2, 4))
+        self.settings_btn.bind("<Button-1>", self.open_settings_dialog)
+        self.settings_btn.bind("<Enter>", lambda e: self.settings_btn.config(bg="#E0E0E0"))
+        self.settings_btn.bind("<Leave>", lambda e: self.settings_btn.config(bg=theme["bg"]))
 
         # 今日进度提示
         self.date_info_bar = tk.Frame(self.root, bg=theme["bg"], height=22)
@@ -725,7 +1017,7 @@ class StickyNote:
         self.toolbar.pack(fill=tk.X, side=tk.BOTTOM)
 
         # 工具栏按钮：带悬停圆角效果
-        def _hover_btn(parent, text, cmd, padx=2, side=tk.LEFT, inner_padx=4):
+        def _hover_btn(parent, text, cmd, padx=1, side=tk.LEFT, inner_padx=3):
             btn = tk.Label(parent, text=text, bg=theme["bg"], fg=theme["fg"],
                            font=("Microsoft YaHei", 9), cursor="hand2",
                            padx=inner_padx, pady=1)
@@ -740,10 +1032,10 @@ class StickyNote:
         self.theme_btn = _hover_btn(self.toolbar, "主题", lambda e: self.open_theme_dialog())
         self.color_btn = _hover_btn(self.toolbar, "颜色", self.cycle_color)
         self.clock_btn = _hover_btn(self.toolbar, "时钟", lambda e: self.toggle_clock())
+        self.today_btn = _hover_btn(self.toolbar, "今日", lambda e: self.show_today_agenda())
         self.remind_btn = _hover_btn(self.toolbar, "+提醒", self.set_reminder)
         self.remind_count = _hover_btn(self.toolbar, f"提醒({len(self.reminders)})", lambda e: self.show_reminders())
         self.schedule_btn = _hover_btn(self.toolbar, "日程", lambda e: self.show_schedules())
-        self.data_btn = _hover_btn(self.toolbar, "数据", self.show_data_menu, side=tk.RIGHT)
 
         self.time_label = tk.Label(self.toolbar, text="", bg=theme["bg"], fg=theme["fg"], font=("Microsoft YaHei", 9))
         self.time_label.pack(side=tk.RIGHT, padx=(2, 4))
@@ -1291,6 +1583,11 @@ class StickyNote:
             for idx, item in enumerate(schedule_items):
                 item_text = self.schedule_menu_text(item, idx)
                 item_menu = tk.Menu(menu, tearoff=0)
+                done_label = "标记未完成" if self.is_schedule_done(item) else "标记完成"
+                item_menu.add_command(
+                    label=done_label,
+                    command=lambda i=idx, done=not self.is_schedule_done(item): self.set_schedule_done(year, month, day, i, done),
+                )
                 item_menu.add_command(
                     label="编辑",
                     command=lambda i=idx: self.add_schedule(year, month, day, edit_index=i),
@@ -1318,10 +1615,11 @@ class StickyNote:
         theme = self.get_theme()
         for widget in [self.title_bar, self.date_info_bar, self.weather_frame, self.toolbar, self.calendar_frame]:
             widget.config(bg=theme["bg"])
-        for widget in [self.title_label, self.close_btn, self.min_btn, self.cal_btn, self.theme_btn,
+        for widget in [self.title_label, self.close_btn, self.min_btn, self.settings_btn,
+                       self.cal_btn, self.theme_btn,
                        self.clock_btn,
-                       self.color_btn, self.remind_btn, self.remind_count, self.schedule_btn,
-                       self.data_btn, self.time_label]:
+                       self.color_btn, self.today_btn, self.remind_btn, self.remind_count, self.schedule_btn,
+                       self.time_label]:
             widget.config(bg=theme["bg"], fg=theme["fg"])
         self.date_text_label.config(bg=theme["bg"], fg=theme.get("today", theme["fg"]))
         self.weather_icon_label.config(bg=theme["bg"], fg=weather_icon_color(self.weather_icon, theme))
@@ -1920,7 +2218,7 @@ class StickyNote:
         y = self.root.winfo_y() + event.y - self.drag_y
         self.root.geometry(f"+{x}+{y}")
 
-    def auto_save(self):
+    def collect_current_data(self):
         self.data["content"] = self.text.get("1.0", tk.END).strip()
         self.data["color"] = self.current_color
         self.data["custom_colors"] = self.custom_colors
@@ -1935,6 +2233,22 @@ class StickyNote:
                 "x": self.clock_window.winfo_x(),
                 "y": self.clock_window.winfo_y(),
             }
+
+    def touch_sync_meta(self):
+        meta = self.data.get("_sync_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["updated_at"] = utc_now_iso()
+        meta["device_id"] = self.sync_config.get("device_id", "")
+        self.data["_sync_meta"] = meta
+
+    def ensure_sync_meta(self):
+        if not get_data_sync_updated_at(self.data):
+            self.touch_sync_meta()
+
+    def auto_save(self):
+        self.collect_current_data()
+        self.touch_sync_meta()
         return self.save_data()
 
     def load_data(self):
@@ -1948,6 +2262,22 @@ class StickyNote:
                 print(f"[读取失败] {e}")
         return {}
 
+    def load_sync_config(self):
+        if os.path.exists(SYNC_CONFIG_FILE):
+            try:
+                return normalize_sync_config(read_data_file(SYNC_CONFIG_FILE))
+            except Exception as e:
+                print(f"[同步配置读取失败] {e}")
+        return normalize_sync_config({})
+
+    def save_sync_config(self):
+        try:
+            write_data_file(SYNC_CONFIG_FILE, normalize_sync_config(self.sync_config), encrypted=True)
+            return True
+        except Exception as e:
+            print(f"[同步配置保存失败] {e}")
+            return False
+
     def save_data(self):
         try:
             write_data_file(DATA_FILE, self.data, encrypted=True)
@@ -1956,16 +2286,529 @@ class StickyNote:
             print(f"[保存失败] {e}")
             return False
 
+    def open_settings_dialog(self, event=None):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("设置")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        x = self.root.winfo_x() + 18
+        y = self.root.winfo_y() + 45
+        dialog.geometry(f"380x620+{x}+{y}")
+
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        text_fg = "#263238"
+        muted_fg = "#607D8B"
+        dialog.config(bg=bg)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="设置",
+            bg=accent,
+            fg="#FFFFFF",
+            font=("Microsoft YaHei", 14, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(12, 1))
+        tk.Label(
+            header,
+            text="主题、城市、开机启动、云同步和数据备份",
+            bg=accent,
+            fg="#F5F7FA",
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        body = tk.Frame(dialog, bg=bg)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        def make_section(title, desc):
+            section = tk.Frame(body, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+            section.pack(fill=tk.X, pady=(0, 9))
+            text_area = tk.Frame(section, bg=panel_bg)
+            text_area.pack(fill=tk.X, padx=12, pady=(10, 6))
+            tk.Label(text_area, text=title, bg=panel_bg, fg=text_fg,
+                     font=("Microsoft YaHei", 10, "bold"), anchor="w").pack(fill=tk.X)
+            tk.Label(text_area, text=desc, bg=panel_bg, fg=muted_fg,
+                     font=("Microsoft YaHei", 9), anchor="w").pack(fill=tk.X, pady=(2, 0))
+            action_area = tk.Frame(section, bg=panel_bg)
+            action_area.pack(fill=tk.X, padx=12, pady=(0, 10))
+            return action_area
+
+        def make_button(parent, text, command, bg_color=accent, fg="#FFFFFF"):
+            btn = tk.Label(parent, text=text, bg=bg_color, fg=fg,
+                           font=("Microsoft YaHei", 9, "bold"),
+                           padx=12, pady=5, cursor="hand2")
+            btn.bind("<Button-1>", lambda e: command())
+            hover = "#0D47A1" if bg_color == accent else "#DDE3EA"
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover))
+            btn.bind("<Leave>", lambda e, b=btn, normal=bg_color: b.config(bg=normal))
+            return btn
+
+        def close_then(command):
+            dialog.destroy()
+            command()
+
+        theme_area = make_section(
+            "1. 主题设置",
+            "调整便签、日历和按钮颜色。",
+        )
+        theme_btn = make_button(theme_area, "打开主题设置", lambda: close_then(self.open_theme_dialog))
+        theme_btn.pack(side=tk.RIGHT)
+
+        startup_area = make_section(
+            "2. 设置开机自启动",
+            "控制 Windows 登录后是否自动启动雨然日历。",
+        )
+        startup_status = tk.Label(startup_area, bg=panel_bg, fg=muted_fg,
+                                  font=("Microsoft YaHei", 9), anchor="w")
+        startup_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def refresh_startup_status():
+            enabled = self.is_startup_enabled()
+            startup_status.config(text="当前：已开启" if enabled else "当前：未开启")
+            startup_btn.config(text="关闭" if enabled else "开启")
+
+        def toggle_and_refresh():
+            self.toggle_startup()
+            refresh_startup_status()
+
+        startup_btn = make_button(startup_area, "开启", toggle_and_refresh)
+        startup_btn.pack(side=tk.RIGHT)
+        refresh_startup_status()
+
+        city_area = make_section(
+            "3. 设置城市",
+            "修改天气展示使用的城市。",
+        )
+        city_name = extract_weather_city_text(self.weather_info)
+        tk.Label(city_area, text=f"当前：{city_name}", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 9), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        city_btn = make_button(city_area, "设置城市", lambda: close_then(lambda: self.prompt_weather_location(force=True)))
+        city_btn.pack(side=tk.RIGHT)
+
+        cloud_area = make_section(
+            "4. 云同步",
+            "使用 WebDAV 上传和下载加密同步文件。",
+        )
+        sync_ready = self.is_sync_config_ready()
+        sync_text = "当前：已配置" if sync_ready else "当前：未配置"
+        tk.Label(cloud_area, text=sync_text, bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 9), anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sync_config_btn = make_button(cloud_area, "配置", lambda: close_then(self.open_sync_dialog))
+        sync_now_btn = make_button(cloud_area, "立即同步", lambda: close_then(self.sync_now_interactive), "#ECEFF1", "#455A64")
+        sync_config_btn.pack(side=tk.RIGHT)
+        sync_now_btn.pack(side=tk.RIGHT, padx=(0, 6))
+
+        backup_area = make_section(
+            "5. 数据备份",
+            "导入、导出便签、日程、提醒和设置。",
+        )
+        export_enc_btn = make_button(backup_area, "加密备份", lambda: close_then(self.export_encrypted_backup))
+        export_plain_btn = make_button(backup_area, "明文导出", lambda: close_then(self.export_plain_backup), "#ECEFF1", "#455A64")
+        import_btn = make_button(backup_area, "导入", lambda: close_then(self.import_data_backup), "#ECEFF1", "#455A64")
+        export_enc_btn.pack(side=tk.LEFT, padx=(0, 6))
+        export_plain_btn.pack(side=tk.LEFT, padx=(0, 6))
+        import_btn.pack(side=tk.LEFT)
+
+        footer = tk.Frame(dialog, bg=bg)
+        footer.pack(fill=tk.X, padx=12, pady=(0, 12))
+        close_btn = make_button(footer, "关闭", dialog.destroy, "#ECEFF1", "#455A64")
+        close_btn.pack(side=tk.RIGHT)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
     def show_data_menu(self, event=None):
-        menu = tk.Menu(self.root, tearoff=0, font=("Microsoft YaHei", 10))
-        menu.add_command(label="导出加密备份...", command=self.export_encrypted_backup)
-        menu.add_command(label="导出明文 JSON...", command=self.export_plain_backup)
-        menu.add_separator()
-        menu.add_command(label="导入数据...", command=self.import_data_backup)
-        if event is not None:
-            menu.tk_popup(event.x_root, event.y_root)
-        else:
-            menu.tk_popup(self.root.winfo_x() + 80, self.root.winfo_y() + self.root.winfo_height() - 30)
+        """兼容旧入口：打开设置窗口。"""
+        self.open_settings_dialog(event)
+
+    def is_sync_config_ready(self, config=None):
+        try:
+            validate_webdav_config(config or self.sync_config)
+            return CRYPTOGRAPHY_OK
+        except Exception:
+            return False
+
+    def save_sync_dialog_config(self, config):
+        self.sync_config = normalize_sync_config(config)
+        return self.save_sync_config()
+
+    def open_sync_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("WebDAV 加密同步")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        x = self.root.winfo_x() + 18
+        y = self.root.winfo_y() + 45
+        dialog.geometry(f"430x565+{x}+{y}")
+
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        text_fg = "#263238"
+        muted_fg = "#607D8B"
+        dialog.config(bg=bg)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        tk.Label(header, text="WebDAV 加密同步", bg=accent, fg="#FFFFFF",
+                 font=("Microsoft YaHei", 14, "bold"), anchor="w").pack(fill=tk.X, padx=16, pady=(12, 1))
+        tk.Label(header, text="云端只保存同步密码加密后的数据包", bg=accent, fg="#F5F7FA",
+                 font=("Microsoft YaHei", 9), anchor="w").pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        form = tk.Frame(dialog, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+        form.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        cfg = normalize_sync_config(self.sync_config)
+        server_var = tk.StringVar(value=cfg.get("server_url", ""))
+        username_var = tk.StringVar(value=cfg.get("username", ""))
+        password_var = tk.StringVar(value=cfg.get("password", ""))
+        remote_path_var = tk.StringVar(value=cfg.get("remote_path", SYNC_DEFAULT_REMOTE_PATH))
+        sync_password_var = tk.StringVar(value=cfg.get("sync_password", ""))
+        enabled_var = tk.BooleanVar(value=cfg.get("enabled", False))
+        auto_sync_var = tk.BooleanVar(value=cfg.get("auto_sync", False))
+        status_var = tk.StringVar(value="未配置" if not self.is_sync_config_ready(cfg) else "已配置")
+
+        def field(label, var, show=None):
+            row = tk.Frame(form, bg=panel_bg)
+            row.pack(fill=tk.X, padx=14, pady=(10, 0))
+            tk.Label(row, text=label, bg=panel_bg, fg=text_fg,
+                     font=("Microsoft YaHei", 9, "bold"), width=11, anchor="w").pack(side=tk.LEFT)
+            entry = tk.Entry(row, textvariable=var, show=show, font=("Microsoft YaHei", 9))
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            return entry
+
+        field("WebDAV 地址", server_var)
+        field("账号", username_var)
+        field("应用密码", password_var, "*")
+        field("远程文件", remote_path_var)
+        field("同步密码", sync_password_var, "*")
+
+        options = tk.Frame(form, bg=panel_bg)
+        options.pack(fill=tk.X, padx=14, pady=(10, 0))
+        tk.Checkbutton(options, text="启用云同步", variable=enabled_var,
+                       bg=panel_bg, activebackground=panel_bg, fg=text_fg,
+                       font=("Microsoft YaHei", 9), selectcolor=panel_bg).pack(side=tk.LEFT)
+        tk.Checkbutton(options, text="启动时自动同步", variable=auto_sync_var,
+                       bg=panel_bg, activebackground=panel_bg, fg=text_fg,
+                       font=("Microsoft YaHei", 9), selectcolor=panel_bg).pack(side=tk.LEFT, padx=(14, 0))
+
+        hint = (
+            "同步密码用于跨设备解密，忘记后无法恢复云端数据。"
+            "WebDAV 应用密码和同步密码只保存在本机加密配置中。"
+        )
+        tk.Label(form, text=hint, bg=panel_bg, fg=muted_fg, wraplength=370,
+                 justify=tk.LEFT, font=("Microsoft YaHei", 8)).pack(fill=tk.X, padx=14, pady=(10, 0))
+
+        status = tk.Label(form, textvariable=status_var, bg=panel_bg, fg=muted_fg,
+                          anchor="w", font=("Microsoft YaHei", 9))
+        status.pack(fill=tk.X, padx=14, pady=(10, 0))
+
+        def gather_config():
+            gathered = dict(self.sync_config)
+            gathered.update({
+                "enabled": enabled_var.get(),
+                "server_url": server_var.get().strip(),
+                "username": username_var.get().strip(),
+                "password": password_var.get(),
+                "remote_path": remote_path_var.get().strip() or SYNC_DEFAULT_REMOTE_PATH,
+                "sync_password": sync_password_var.get(),
+                "auto_sync": auto_sync_var.get(),
+            })
+            return normalize_sync_config(gathered)
+
+        def save_config(show_message=True):
+            config = gather_config()
+            if self.save_sync_dialog_config(config):
+                status_var.set("配置已保存")
+                if show_message:
+                    messagebox.showinfo("保存成功", "WebDAV 同步配置已保存。", parent=dialog)
+                return True
+            messagebox.showerror("保存失败", "同步配置写入失败。", parent=dialog)
+            return False
+
+        def run_test():
+            config = gather_config()
+            try:
+                validate_webdav_config(config)
+            except Exception as e:
+                messagebox.showwarning("配置不完整", str(e), parent=dialog)
+                return
+            if not save_config(show_message=False):
+                return
+            status_var.set("正在测试连接...")
+
+            def worker():
+                webdav_test_connection(config)
+                return "WebDAV 连接测试成功。"
+
+            self.run_sync_background(dialog, status_var, worker, lambda msg: messagebox.showinfo("测试成功", msg, parent=dialog))
+
+        def run_sync():
+            if save_config(show_message=False):
+                self.sync_now_interactive(parent=dialog, status_var=status_var)
+
+        def run_upload():
+            if save_config(show_message=False):
+                self.upload_sync_interactive(parent=dialog, status_var=status_var)
+
+        def run_download():
+            if save_config(show_message=False):
+                self.download_sync_interactive(parent=dialog, status_var=status_var)
+
+        buttons = tk.Frame(dialog, bg=bg)
+        buttons.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Button(buttons, text="保存配置", command=save_config,
+                  font=("Microsoft YaHei", 9), width=9).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(buttons, text="测试连接", command=run_test,
+                  font=("Microsoft YaHei", 9), width=9).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(buttons, text="立即同步", command=run_sync,
+                  font=("Microsoft YaHei", 9, "bold"), width=9).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(buttons, text="关闭", command=dialog.destroy,
+                  font=("Microsoft YaHei", 9), width=7).pack(side=tk.RIGHT)
+
+        more_buttons = tk.Frame(dialog, bg=bg)
+        more_buttons.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Button(more_buttons, text="上传本机覆盖云端", command=run_upload,
+                  font=("Microsoft YaHei", 9), width=18).pack(side=tk.LEFT)
+        tk.Button(more_buttons, text="下载云端覆盖本机", command=run_download,
+                  font=("Microsoft YaHei", 9), width=18).pack(side=tk.RIGHT)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+    def run_sync_background(self, parent, status_var, worker, on_success=None, on_error=None):
+        def finish_success(result):
+            if status_var is not None:
+                status_var.set(str(result))
+            if on_success:
+                on_success(result)
+
+        def finish_error(error):
+            if status_var is not None:
+                status_var.set("操作失败")
+            if on_error:
+                on_error(error)
+            else:
+                messagebox.showerror("同步失败", str(error), parent=parent or self.root)
+
+        def run():
+            try:
+                result = worker()
+            except Exception as e:
+                self.root.after(0, lambda err=e: finish_error(err))
+            else:
+                self.root.after(0, lambda res=result: finish_success(res))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def prepare_sync_snapshot(self):
+        self.collect_current_data()
+        self.ensure_sync_meta()
+        if not self.save_data():
+            raise RuntimeError("本地数据保存失败，已取消同步")
+        return json.loads(json.dumps(self.data, ensure_ascii=False))
+
+    def update_sync_success(self, config, synced_updated_at):
+        config = normalize_sync_config(config)
+        config["enabled"] = True
+        config["last_sync_at"] = utc_now_iso()
+        config["last_synced_updated_at"] = synced_updated_at or ""
+        self.sync_config = config
+        self.save_sync_config()
+
+    def write_sync_conflict_backup(self, data, source):
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(_app_dir(), f"sync-conflict-{source}-{timestamp}.yuran")
+        write_data_file(path, data, encrypted=True)
+        return path
+
+    def upload_snapshot_to_webdav(self, snapshot, config):
+        envelope = encrypt_sync_package(snapshot, config.get("sync_password", ""), config.get("device_id", ""))
+        webdav_upload_sync_package(config, envelope)
+        return envelope.get("updated_at")
+
+    def sync_now_interactive(self, parent=None, status_var=None, show_success=True):
+        config = normalize_sync_config(self.sync_config)
+        if not CRYPTOGRAPHY_OK:
+            messagebox.showerror("缺少依赖", "当前环境未安装 cryptography，无法使用 WebDAV 加密同步。", parent=parent or self.root)
+            return
+        try:
+            validate_webdav_config(config)
+        except Exception as e:
+            messagebox.showwarning("同步未配置", f"{e}\n\n请先配置 WebDAV 加密同步。", parent=parent or self.root)
+            self.open_sync_dialog()
+            return
+
+        try:
+            snapshot = self.prepare_sync_snapshot()
+        except Exception as e:
+            messagebox.showerror("同步失败", str(e), parent=parent or self.root)
+            return
+
+        if status_var is not None:
+            status_var.set("正在同步...")
+
+        def worker():
+            remote_envelope = webdav_download_sync_package(config)
+            local_updated = get_data_sync_updated_at(snapshot)
+            if remote_envelope is None:
+                uploaded_at = self.upload_snapshot_to_webdav(snapshot, config)
+                return {"action": "uploaded", "updated_at": uploaded_at, "message": "云端无数据，已上传本机数据。"}
+
+            remote_payload = decrypt_sync_package(remote_envelope, config.get("sync_password", ""))
+            remote_data = remote_payload["data"]
+            remote_updated = remote_payload.get("updated_at") or get_data_sync_updated_at(remote_data)
+            last_synced = config.get("last_synced_updated_at")
+            local_time = parse_sync_time(local_updated)
+            remote_time = parse_sync_time(remote_updated)
+            last_time = parse_sync_time(last_synced)
+
+            if local_updated == remote_updated:
+                return {"action": "none", "updated_at": local_updated, "message": "本机和云端已经一致。"}
+            if last_time > datetime.min and local_time > last_time and remote_time > last_time:
+                return {
+                    "action": "conflict",
+                    "local_data": snapshot,
+                    "remote_data": remote_data,
+                    "local_updated": local_updated,
+                    "remote_updated": remote_updated,
+                }
+            if remote_time > local_time:
+                return {"action": "download", "remote_data": remote_data, "updated_at": remote_updated}
+
+            uploaded_at = self.upload_snapshot_to_webdav(snapshot, config)
+            return {"action": "uploaded", "updated_at": uploaded_at, "message": "本机数据较新，已上传到云端。"}
+
+        def on_success(result):
+            action = result.get("action")
+            if action in ("uploaded", "none"):
+                self.update_sync_success(config, result.get("updated_at"))
+                msg = result.get("message", "同步完成。")
+                if status_var is not None:
+                    status_var.set(msg)
+                if show_success:
+                    messagebox.showinfo("同步完成", msg, parent=parent or self.root)
+            elif action == "download":
+                if not messagebox.askyesno(
+                    "云端数据较新",
+                    "检测到云端数据较新。\n\n是否先备份本机数据，然后下载云端数据覆盖本机？",
+                    parent=parent or self.root,
+                ):
+                    if status_var is not None:
+                        status_var.set("已取消下载")
+                    return
+                backup_path = self.write_sync_conflict_backup(self.data, "local")
+                self.apply_loaded_data(result["remote_data"])
+                self.save_data()
+                self.update_sync_success(config, result.get("updated_at"))
+                messagebox.showinfo("同步完成", f"已下载云端数据。\n本机旧数据已备份：\n{backup_path}", parent=parent or self.root)
+                if status_var is not None:
+                    status_var.set("已下载云端数据")
+            elif action == "conflict":
+                choice = messagebox.askyesno(
+                    "同步冲突",
+                    "检测到本机和云端都修改过。\n\n选择“是”：备份本机并下载云端。\n选择“否”：备份云端并上传本机。",
+                    parent=parent or self.root,
+                )
+                if choice:
+                    backup_path = self.write_sync_conflict_backup(self.data, "local")
+                    self.apply_loaded_data(result["remote_data"])
+                    self.save_data()
+                    self.update_sync_success(config, result.get("remote_updated"))
+                    messagebox.showinfo("同步完成", f"已下载云端数据。\n本机旧数据已备份：\n{backup_path}", parent=parent or self.root)
+                    if status_var is not None:
+                        status_var.set("已解决冲突：下载云端")
+                else:
+                    backup_path = self.write_sync_conflict_backup(result["remote_data"], "cloud")
+                    if status_var is not None:
+                        status_var.set("正在上传本机数据...")
+
+                    def upload_worker():
+                        uploaded_at = self.upload_snapshot_to_webdav(result["local_data"], config)
+                        return uploaded_at
+
+                    def upload_done(uploaded_at):
+                        self.update_sync_success(config, uploaded_at)
+                        messagebox.showinfo("同步完成", f"已上传本机数据。\n云端旧数据已备份：\n{backup_path}", parent=parent or self.root)
+                        if status_var is not None:
+                            status_var.set("已解决冲突：上传本机")
+
+                    self.run_sync_background(parent, status_var, upload_worker, upload_done)
+
+        self.run_sync_background(parent, status_var, worker, on_success)
+
+    def upload_sync_interactive(self, parent=None, status_var=None):
+        config = normalize_sync_config(self.sync_config)
+        try:
+            validate_webdav_config(config)
+            snapshot = self.prepare_sync_snapshot()
+        except Exception as e:
+            messagebox.showerror("上传失败", str(e), parent=parent or self.root)
+            return
+        if not messagebox.askyesno("上传本机数据", "上传会用本机数据覆盖云端同步文件。\n\n确定继续吗？", parent=parent or self.root):
+            return
+        if status_var is not None:
+            status_var.set("正在上传本机数据...")
+
+        def worker():
+            remote_data = None
+            remote_envelope = webdav_download_sync_package(config)
+            if remote_envelope is not None:
+                remote_data = decrypt_sync_package(remote_envelope, config.get("sync_password", ""))["data"]
+            backup_path = self.write_sync_conflict_backup(remote_data, "cloud") if remote_data else ""
+            uploaded_at = self.upload_snapshot_to_webdav(snapshot, config)
+            return uploaded_at, backup_path
+
+        def on_success(result):
+            uploaded_at, backup_path = result
+            self.update_sync_success(config, uploaded_at)
+            msg = "已上传本机数据到云端。"
+            if backup_path:
+                msg += f"\n云端旧数据已备份：\n{backup_path}"
+            messagebox.showinfo("上传完成", msg, parent=parent or self.root)
+
+        self.run_sync_background(parent, status_var, worker, on_success)
+
+    def download_sync_interactive(self, parent=None, status_var=None):
+        config = normalize_sync_config(self.sync_config)
+        try:
+            validate_webdav_config(config)
+        except Exception as e:
+            messagebox.showerror("下载失败", str(e), parent=parent or self.root)
+            return
+        if not messagebox.askyesno("下载云端数据", "下载会先备份本机数据，然后用云端数据覆盖本机。\n\n确定继续吗？", parent=parent or self.root):
+            return
+        self.collect_current_data()
+        self.save_data()
+        if status_var is not None:
+            status_var.set("正在下载云端数据...")
+
+        def worker():
+            remote_envelope = webdav_download_sync_package(config)
+            if remote_envelope is None:
+                raise RuntimeError("云端还没有同步文件")
+            remote_payload = decrypt_sync_package(remote_envelope, config.get("sync_password", ""))
+            return remote_payload["data"], remote_payload.get("updated_at")
+
+        def on_success(result):
+            remote_data, remote_updated = result
+            backup_path = self.write_sync_conflict_backup(self.data, "local")
+            self.apply_loaded_data(remote_data)
+            self.save_data()
+            self.update_sync_success(config, remote_updated)
+            messagebox.showinfo("下载完成", f"已下载云端数据。\n本机旧数据已备份：\n{backup_path}", parent=parent or self.root)
+            if status_var is not None:
+                status_var.set("已下载云端数据")
+
+        self.run_sync_background(parent, status_var, worker, on_success)
 
     def export_encrypted_backup(self):
         self.auto_save()
@@ -2252,6 +3095,30 @@ class StickyNote:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def get_schedule_text(self, item):
+        if isinstance(item, dict):
+            return str(item.get("text") or item.get("content") or "").strip()
+        return str(item).strip()
+
+    def is_schedule_done(self, item):
+        return isinstance(item, dict) and item.get("done") is True
+
+    def make_schedule_item(self, text, done=False):
+        return {
+            "text": str(text).strip(),
+            "done": bool(done),
+        }
+
+    def update_schedule_item_text(self, item, text):
+        return self.make_schedule_item(text, self.is_schedule_done(item))
+
+    def update_schedule_item_done(self, item, done):
+        return self.make_schedule_item(self.get_schedule_text(item), done)
+
+    def schedule_display_text(self, item):
+        text = self.get_schedule_text(item) or "未命名日程"
+        return f"✓ {text}" if self.is_schedule_done(item) else text
+
     def schedule_entry_datetime(self, date_key, item):
         hour, minute, content = self.parse_schedule_item(item)
         try:
@@ -2273,14 +3140,18 @@ class StickyNote:
                     "item": item,
                     "datetime": schedule_dt,
                     "content": content,
+                    "done": self.is_schedule_done(item),
                 })
 
         now = datetime.now()
-        upcoming = [entry for entry in entries if entry["datetime"] >= now]
-        passed = [entry for entry in entries if entry["datetime"] < now]
+        active = [entry for entry in entries if not entry["done"]]
+        done = [entry for entry in entries if entry["done"]]
+        upcoming = [entry for entry in active if entry["datetime"] >= now]
+        passed = [entry for entry in active if entry["datetime"] < now]
         upcoming.sort(key=lambda entry: (entry["datetime"], entry["date_key"], entry["index"]))
         passed.sort(key=lambda entry: (entry["datetime"], entry["date_key"], entry["index"]), reverse=True)
-        return upcoming + passed
+        done.sort(key=lambda entry: (entry["datetime"], entry["date_key"], entry["index"]), reverse=True)
+        return upcoming + passed + done
 
     def show_schedules(self, event=None):
         """打开日程列表对话框"""
@@ -2385,11 +3256,12 @@ class StickyNote:
             now = datetime.now()
             for entry in entries:
                 schedule_dt = entry["datetime"]
+                is_done = entry["done"]
                 is_passed = schedule_dt < now
                 row = tk.Frame(scroll_frame, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
                 row.pack(fill=tk.X, padx=12, pady=5)
 
-                bar_color = "#9E9E9E" if is_passed else accent
+                bar_color = "#9E9E9E" if (is_passed or is_done) else accent
                 bar = tk.Frame(row, bg=bar_color, width=4)
                 bar.pack(side=tk.LEFT, fill=tk.Y)
 
@@ -2397,24 +3269,32 @@ class StickyNote:
                 body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=9, pady=8)
 
                 weekday = WEEKDAYS[schedule_dt.weekday()] if schedule_dt != datetime.max else ""
-                status = "  已过" if is_passed else ""
+                status = "  已办" if is_done else ("  已过" if is_passed else "")
                 time_text = schedule_dt.strftime("%Y-%m-%d %H:%M") if schedule_dt != datetime.max else entry["date_key"]
                 tk.Label(body, text=f"{time_text} {weekday}{status}",
                          bg=panel_bg, fg=muted_fg, font=("Microsoft YaHei", 9, "bold"),
                          anchor="w").pack(fill=tk.X)
                 tk.Label(body, text=entry["content"] or "未命名日程",
-                         bg=panel_bg, fg=text_fg, font=("Microsoft YaHei", 10),
+                         bg=panel_bg, fg=("#9E9E9E" if is_done else text_fg), font=("Microsoft YaHei", 10),
                          anchor="w", justify=tk.LEFT, wraplength=235).pack(fill=tk.X, pady=(3, 0))
 
                 actions = tk.Frame(row, bg=panel_bg)
                 actions.pack(side=tk.RIGHT, padx=(0, 8), pady=8)
 
-                edit_btn = tk.Label(actions, text="编辑", bg=panel_bg, fg="#1976D2",
-                                    font=("Microsoft YaHei", 9), cursor="hand2")
-                edit_btn.pack(anchor="e")
-                delete_btn = tk.Label(actions, text="删除", bg=panel_bg, fg="#D32F2F",
-                                      font=("Microsoft YaHei", 9), cursor="hand2")
-                delete_btn.pack(anchor="e", pady=(6, 0))
+                done_var = tk.BooleanVar(value=is_done)
+
+                def do_toggle_done(date_key=entry["date_key"], index=entry["index"], done_var=done_var, original=is_done):
+                    try:
+                        year, month, day = [int(part) for part in date_key.split("-")]
+                    except ValueError:
+                        done_var.set(original)
+                        messagebox.showwarning("操作失败", "日程日期格式无效。", parent=dialog)
+                        return
+                    if self.set_schedule_done(year, month, day, index, done_var.get(), parent=dialog):
+                        dialog.destroy()
+                        self.show_schedules()
+                    else:
+                        done_var.set(original)
 
                 def do_edit(date_key=entry["date_key"], index=entry["index"]):
                     try:
@@ -2434,6 +3314,28 @@ class StickyNote:
                     if self.delete_schedule(year, month, day, index, parent=dialog):
                         dialog.destroy()
                         self.show_schedules()
+
+                done_cb = tk.Checkbutton(
+                    actions,
+                    text="已办",
+                    variable=done_var,
+                    command=do_toggle_done,
+                    bg=panel_bg,
+                    activebackground=panel_bg,
+                    fg=("#757575" if is_done else "#2E7D32"),
+                    activeforeground="#757575",
+                    selectcolor=panel_bg,
+                    font=("Microsoft YaHei", 9),
+                    cursor="hand2",
+                    highlightthickness=0,
+                )
+                done_cb.pack(anchor="e")
+                edit_btn = tk.Label(actions, text="编辑", bg=panel_bg, fg="#1976D2",
+                                    font=("Microsoft YaHei", 9), cursor="hand2")
+                edit_btn.pack(anchor="e", pady=(6, 0))
+                delete_btn = tk.Label(actions, text="删除", bg=panel_bg, fg="#D32F2F",
+                                      font=("Microsoft YaHei", 9), cursor="hand2")
+                delete_btn.pack(anchor="e", pady=(6, 0))
 
                 edit_btn.bind("<Button-1>", lambda e, f=do_edit: f())
                 delete_btn.bind("<Button-1>", lambda e, f=do_delete: f())
@@ -2455,14 +3357,211 @@ class StickyNote:
         close_btn.bind("<Button-1>", lambda e: dialog.destroy())
         dialog.bind("<Escape>", lambda e: dialog.destroy())
 
+    def reminder_matches_agenda_date(self, reminder, dt):
+        if not reminder_is_enabled(reminder):
+            return False
+        if reminder.get("type", "once") == "once" and reminder.get("done"):
+            return False
+        if reminder.get("type") == "daily":
+            return True
+        lunar_year, lunar_month, lunar_day = self.get_lunar_parts_for_date(dt)
+        return self.reminder_matches_date(reminder, dt, lunar_year, lunar_month, lunar_day)
+
+    def collect_agenda_for_date(self, target_date):
+        date_key = target_date.strftime("%Y-%m-%d")
+        schedules = []
+        for index, item in enumerate(self.schedules.get(date_key, [])):
+            schedule_dt, content = self.schedule_entry_datetime(date_key, item)
+            schedules.append({
+                "kind": "日程",
+                "time": schedule_dt,
+                "content": content or self.get_schedule_text(item) or "未命名日程",
+                "index": index,
+                "done": self.is_schedule_done(item),
+            })
+
+        reminders = []
+        base_dt = datetime(target_date.year, target_date.month, target_date.day)
+        for reminder in self.reminders:
+            try:
+                if not self.reminder_matches_agenda_date(reminder, base_dt):
+                    continue
+                hour = safe_int(reminder.get("hour"), 0)
+                minute = safe_int(reminder.get("minute"), 0)
+                reminder_dt = base_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                reminders.append({
+                    "kind": self.format_date_reminder_type(reminder),
+                    "time": reminder_dt,
+                    "content": reminder.get("message", "") or "未命名提醒",
+                    "advance_minutes": get_advance_minutes(reminder),
+                })
+            except Exception:
+                continue
+
+        items = schedules + reminders
+        items.sort(key=lambda item: (1 if item.get("done") else 0, item["time"], 0 if item["kind"] == "日程" else 1, item["content"]))
+        return items
+
+    def show_today_agenda(self, event=None):
+        """打开今日事项面板，展示今天和明天的日程/提醒。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("今日事项")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        x = self.root.winfo_x() + 10
+        y = self.root.winfo_y() + 40
+        dialog.geometry(f"380x460+{x}+{y}")
+
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        muted_fg = "#607D8B"
+        text_fg = "#263238"
+        dialog.config(bg=bg)
+
+        today = datetime.now().date()
+        agenda_days = [today, today + timedelta(days=1)]
+        agenda = [(day, self.collect_agenda_for_date(day)) for day in agenda_days]
+        total_count = sum(len(items) for _, items in agenda)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text=f"今日事项（{total_count}）",
+            bg=accent,
+            fg="#FFFFFF",
+            font=("Microsoft YaHei", 14, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(12, 1))
+        tk.Label(
+            header,
+            text="集中查看今天和明天的日程、提醒",
+            bg=accent,
+            fg="#F5F7FA",
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        list_container = tk.Frame(dialog, bg=bg)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(10, 6))
+        canvas = tk.Canvas(list_container, width=352, height=300, bg=bg, highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg=bg)
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=352)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _scroll_canvas_units(units):
+            if canvas.winfo_exists():
+                canvas.yview_scroll(units, "units")
+
+        def _on_mousewheel(event):
+            if event.delta:
+                units = -int(event.delta / 120)
+                if units == 0:
+                    units = -1 if event.delta > 0 else 1
+                _scroll_canvas_units(units)
+            return "break"
+
+        def _on_scroll_up(event):
+            _scroll_canvas_units(-1)
+            return "break"
+
+        def _on_scroll_down(event):
+            _scroll_canvas_units(1)
+            return "break"
+
+        dialog.bind_all("<MouseWheel>", _on_mousewheel)
+        dialog.bind_all("<Button-4>", _on_scroll_up)
+        dialog.bind_all("<Button-5>", _on_scroll_down)
+
+        def _unbind_mousewheel(event=None):
+            dialog.unbind_all("<MouseWheel>")
+            dialog.unbind_all("<Button-4>")
+            dialog.unbind_all("<Button-5>")
+
+        dialog.bind("<Destroy>", _unbind_mousewheel)
+
+        now = datetime.now()
+        for day, items in agenda:
+            day_title = "今天" if day == today else "明天"
+            weekday = WEEKDAYS[datetime(day.year, day.month, day.day).weekday()]
+            section = tk.Frame(scroll_frame, bg=bg)
+            section.pack(fill=tk.X, padx=10, pady=(0, 8))
+            tk.Label(
+                section,
+                text=f"{day_title}  {day.month}/{day.day} {weekday}",
+                bg=bg,
+                fg=accent,
+                font=("Microsoft YaHei", 10, "bold"),
+                anchor="w",
+            ).pack(fill=tk.X, pady=(0, 4))
+
+            if not items:
+                empty = tk.Frame(section, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+                empty.pack(fill=tk.X)
+                tk.Label(empty, text="暂无事项", bg=panel_bg, fg=muted_fg,
+                         font=("Microsoft YaHei", 9), anchor="w").pack(fill=tk.X, padx=10, pady=10)
+                continue
+
+            for item in items:
+                is_done = item.get("done") is True
+                is_passed = day == today and item["time"] < now
+                row = tk.Frame(section, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+                row.pack(fill=tk.X, pady=3)
+                bar_color = "#9E9E9E" if (is_passed or is_done) else (accent if item["kind"] == "日程" else "#D32F2F")
+                tk.Frame(row, bg=bar_color, width=4).pack(side=tk.LEFT, fill=tk.Y)
+                body = tk.Frame(row, bg=panel_bg)
+                body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=9, pady=7)
+                time_text = item["time"].strftime("%H:%M")
+                if item.get("advance_minutes"):
+                    time_text = format_reminder_time(item["time"].hour, item["time"].minute, item["advance_minutes"])
+                status = "  已办" if is_done else ("  已过" if is_passed else "")
+                tk.Label(body, text=f"{item['kind']}  {time_text}{status}",
+                         bg=panel_bg, fg=muted_fg, font=("Microsoft YaHei", 9, "bold"),
+                         anchor="w").pack(fill=tk.X)
+                tk.Label(body, text=item["content"], bg=panel_bg, fg=("#9E9E9E" if is_done else text_fg),
+                         font=("Microsoft YaHei", 10), anchor="w",
+                         justify=tk.LEFT, wraplength=300).pack(fill=tk.X, pady=(3, 0))
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        footer = tk.Frame(dialog, bg=bg)
+        footer.pack(fill=tk.X, padx=14, pady=(0, 12))
+
+        def add_today_schedule():
+            dialog.destroy()
+            self.add_schedule(today.year, today.month, today.day)
+
+        add_btn = tk.Label(footer, text="添加今日日程", bg=accent, fg="#FFFFFF",
+                           font=("Microsoft YaHei", 10, "bold"),
+                           padx=14, pady=6, cursor="hand2")
+        add_btn.pack(side=tk.LEFT)
+        close_btn = tk.Label(footer, text="关闭", bg="#ECEFF1", fg="#455A64",
+                             font=("Microsoft YaHei", 10, "bold"),
+                             padx=14, pady=6, cursor="hand2")
+        close_btn.pack(side=tk.RIGHT)
+        add_btn.bind("<Button-1>", lambda e: add_today_schedule())
+        close_btn.bind("<Button-1>", lambda e: dialog.destroy())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
     def schedule_menu_text(self, item, index):
-        text = str(item).strip() or "未命名日程"
+        text = self.schedule_display_text(item)
         if len(text) > 26:
             text = text[:25] + "..."
         return f"{index + 1}. {text}"
 
     def parse_schedule_item(self, item):
-        text = str(item).strip()
+        text = self.get_schedule_text(item)
         if (
             len(text) >= 5
             and text[0:2].isdigit()
@@ -2493,9 +3592,23 @@ class StickyNote:
             return None, None
         if date_key not in self.schedules or not isinstance(self.schedules.get(date_key), list):
             self.schedules[date_key] = []
-        if item not in self.schedules[date_key]:
-            self.schedules[date_key].append(item)
+        existing_texts = [self.get_schedule_text(existing) for existing in self.schedules[date_key]]
+        if item not in existing_texts:
+            self.schedules[date_key].append(self.make_schedule_item(item))
         return date_key, item
+
+    def set_schedule_done(self, year, month, day, index, done, parent=None):
+        parent = parent or self.root
+        date_key = f"{year:04d}-{month:02d}-{day:02d}"
+        items = self.schedules.get(date_key, [])
+        if not isinstance(items, list) or not 0 <= index < len(items):
+            messagebox.showwarning("操作失败", "这条日程已经不存在。", parent=parent)
+            return False
+        items[index] = self.update_schedule_item_done(items[index], done)
+        if not self.auto_save():
+            messagebox.showwarning("保存失败", "日程状态已更新，但写入文件失败，重启后可能丢失。", parent=parent)
+        self.build_calendar()
+        return True
 
     def delete_schedule(self, year, month, day, index, parent=None):
         parent = parent or self.root
@@ -2505,7 +3618,7 @@ class StickyNote:
             messagebox.showwarning("删除失败", "这条日程已经不存在。", parent=parent)
             return False
 
-        item = str(items[index]).strip() or "未命名日程"
+        item = self.get_schedule_text(items[index]) or "未命名日程"
         if not messagebox.askyesno("删除日程", f"确定删除这条日程吗？\n\n{item}", parent=parent):
             return False
 
@@ -2528,7 +3641,7 @@ class StickyNote:
             if not isinstance(items, list) or not 0 <= edit_index < len(items):
                 messagebox.showwarning("编辑失败", "这条日程已经不存在。", parent=self.root)
                 return
-            editing_item = str(items[edit_index])
+            editing_item = items[edit_index]
         is_editing = editing_item is not None
 
         dialog = tk.Toplevel(self.root)
@@ -2698,13 +3811,14 @@ class StickyNote:
 
             if date_key not in self.schedules or not isinstance(self.schedules.get(date_key), list):
                 self.schedules[date_key] = []
+            schedule_record = self.update_schedule_item_text(editing_item, item) if is_editing else self.make_schedule_item(item)
             if is_editing:
                 if not 0 <= edit_index < len(self.schedules[date_key]):
                     messagebox.showwarning("保存失败", "这条日程已经不存在。", parent=dialog)
                     return
-                self.schedules[date_key][edit_index] = item
+                self.schedules[date_key][edit_index] = schedule_record
             else:
-                self.schedules[date_key].append(item)
+                self.schedules[date_key].append(schedule_record)
             if reminder_to_add is not None:
                 self.reminders.append(reminder_to_add)
                 self.remind_count.config(text=f"提醒({len(self.reminders)})")
@@ -3851,17 +4965,6 @@ try {
             font=("Microsoft YaHei", 11, "bold"),
             anchor="w",
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        change_btn = tk.Label(
-            header,
-            text="⚙",
-            bg=theme["bg"],
-            fg="#1976D2",
-            font=("Segoe UI Symbol", 11, "bold"),
-            cursor="hand2",
-        )
-        change_btn.pack(side=tk.RIGHT)
-        change_btn.bind("<Button-1>", lambda e: (dialog.destroy(), self.prompt_weather_location(force=True)))
 
         if updated_at:
             tk.Label(

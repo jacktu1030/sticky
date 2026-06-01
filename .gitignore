@@ -58,6 +58,9 @@ notes.zip
 git.txt
 github_token.txt
 notes.json
+sync_config.json
+*.yuran
+sync-conflict-*.yuran
 
 # macOS build
 yuran_calendar_macos/

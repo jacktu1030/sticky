@@ -5,6 +5,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:cryptography/cryptography.dart';
 
 void main() {
   runApp(const StickyApp());
@@ -71,6 +72,10 @@ class Reminder {
   int minute;
   String? lastTriggered;
   bool isLunar;
+  bool enabled;
+  bool done;
+  int advanceMinutes;
+  Map<String, dynamic> extra;
 
   // once
   int? year;
@@ -98,6 +103,9 @@ class Reminder {
     required this.minute,
     this.lastTriggered,
     this.isLunar = false,
+    this.enabled = true,
+    this.done = false,
+    this.advanceMinutes = 0,
     this.year,
     this.month,
     this.day,
@@ -107,15 +115,65 @@ class Reminder {
     this.yearlyDay,
     this.lunarMonth,
     this.lunarDay,
+    this.extra = const {},
   });
 
+  Reminder copyWith({
+    String? type,
+    String? message,
+    int? hour,
+    int? minute,
+    String? lastTriggered,
+    bool? isLunar,
+    bool? enabled,
+    bool? done,
+    int? advanceMinutes,
+    int? year,
+    int? month,
+    int? day,
+    int? weekday,
+    int? monthlyDay,
+    int? yearlyMonth,
+    int? yearlyDay,
+    int? lunarMonth,
+    int? lunarDay,
+    Map<String, dynamic>? extra,
+    bool clearLastTriggered = false,
+  }) =>
+      Reminder(
+        type: type ?? this.type,
+        message: message ?? this.message,
+        hour: hour ?? this.hour,
+        minute: minute ?? this.minute,
+        lastTriggered:
+            clearLastTriggered ? null : (lastTriggered ?? this.lastTriggered),
+        isLunar: isLunar ?? this.isLunar,
+        enabled: enabled ?? this.enabled,
+        done: done ?? this.done,
+        advanceMinutes: advanceMinutes ?? this.advanceMinutes,
+        year: year ?? this.year,
+        month: month ?? this.month,
+        day: day ?? this.day,
+        weekday: weekday ?? this.weekday,
+        monthlyDay: monthlyDay ?? this.monthlyDay,
+        yearlyMonth: yearlyMonth ?? this.yearlyMonth,
+        yearlyDay: yearlyDay ?? this.yearlyDay,
+        lunarMonth: lunarMonth ?? this.lunarMonth,
+        lunarDay: lunarDay ?? this.lunarDay,
+        extra: extra ?? this.extra,
+      );
+
   Map<String, dynamic> toJson() => {
+        ...extra,
         'type': type,
         'message': message,
         'hour': hour,
         'minute': minute,
         'last_triggered': lastTriggered,
         'is_lunar': isLunar,
+        'enabled': enabled,
+        'done': done,
+        'advance_minutes': advanceMinutes,
         if (year != null) 'year': year,
         if (month != null) 'month': month,
         if (day != null) 'day': day,
@@ -127,49 +185,96 @@ class Reminder {
         if (lunarDay != null) 'lunar_day': lunarDay,
       };
 
-  factory Reminder.fromJson(Map<String, dynamic> json) => Reminder(
-        type: json['type'],
-        message: json['message'],
-        hour: json['hour'],
-        minute: json['minute'],
-        lastTriggered: json['last_triggered'],
-        isLunar: json['is_lunar'] ?? false,
-        year: json['year'],
-        month: json['month'],
-        day: json['day'],
-        weekday: json['weekday'],
-        monthlyDay: json['monthly_day'],
-        yearlyMonth: json['yearly_month'],
-        yearlyDay: json['yearly_day'],
-        lunarMonth: json['lunar_month'],
-        lunarDay: json['lunar_day'],
-      );
+  factory Reminder.fromJson(Map<String, dynamic> json) {
+    final extra = Map<String, dynamic>.from(json);
+    for (final key in {
+      'type',
+      'message',
+      'hour',
+      'minute',
+      'last_triggered',
+      'is_lunar',
+      'enabled',
+      'done',
+      'advance_minutes',
+      'year',
+      'month',
+      'day',
+      'weekday',
+      'monthly_day',
+      'yearly_month',
+      'yearly_day',
+      'lunar_month',
+      'lunar_day',
+    }) {
+      extra.remove(key);
+    }
+
+    int? intField(String key) {
+      final value = json[key];
+      if (value == null) return null;
+      if (value is int) return value;
+      if (value is num) return value.toInt();
+      return int.tryParse(value.toString());
+    }
+
+    final type = (json['type'] ?? 'once').toString();
+    final month = intField('month');
+    final day = intField('day');
+    return Reminder(
+      type: type,
+      message: (json['message'] ?? '').toString(),
+      hour: intField('hour') ?? 0,
+      minute: intField('minute') ?? 0,
+      lastTriggered: json['last_triggered']?.toString(),
+      isLunar: json['is_lunar'] ?? false,
+      enabled: json['enabled'] != false,
+      done: json['done'] == true,
+      advanceMinutes: intField('advance_minutes') ?? 0,
+      year: intField('year'),
+      month: month,
+      day: day,
+      weekday: intField('weekday'),
+      monthlyDay: intField('monthly_day') ?? (type == 'monthly' ? day : null),
+      yearlyMonth:
+          intField('yearly_month') ?? (type == 'yearly' ? month : null),
+      yearlyDay: intField('yearly_day') ?? (type == 'yearly' ? day : null),
+      lunarMonth:
+          intField('lunar_month') ?? (type == 'lunar_yearly' ? month : null),
+      lunarDay: intField('lunar_day') ??
+          (type == 'lunar_yearly' || type == 'lunar_monthly' ? day : null),
+      extra: extra,
+    );
+  }
 
   String get displayLabel {
     final timeStr =
         '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+    final advanceText = advanceMinutes > 0 ? '（提前${advanceMinutes}分钟）' : '';
+    final disabledText = enabled ? '' : '（已停用）';
+    final doneText = done ? '（已完成）' : '';
     switch (type) {
       case 'once':
         if (isLunar) {
-          return '农历 $year年$month月$day日 $timeStr';
+          return '农历 $year年$month月$day日 $timeStr$advanceText$disabledText$doneText';
         }
-        return '$year年$month月$day日 $timeStr';
+        return '$year年$month月$day日 $timeStr$advanceText$disabledText$doneText';
       case 'daily':
-        return '每天 $timeStr';
+        return '每天 $timeStr$advanceText$disabledText';
       case 'weekly':
         final weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
         final index = (weekday ?? 0).clamp(0, weekdays.length - 1);
-        return '每周${weekdays[index]} $timeStr';
+        return '每周${weekdays[index]} $timeStr$advanceText$disabledText';
       case 'monthly':
-        return '每月${monthlyDay}号 $timeStr';
+        return '每月${monthlyDay}号 $timeStr$advanceText$disabledText';
       case 'yearly':
-        return '每年$yearlyMonth月$yearlyDay日 $timeStr';
+        return '每年$yearlyMonth月$yearlyDay日 $timeStr$advanceText$disabledText';
       case 'lunar_yearly':
-        return '每年农历$lunarMonth月$lunarDay日 $timeStr';
+        return '每年农历$lunarMonth月$lunarDay日 $timeStr$advanceText$disabledText';
       case 'lunar_monthly':
-        return '每月农历$lunarDay日 $timeStr';
+        return '每月农历$lunarDay日 $timeStr$advanceText$disabledText';
       default:
-        return '$type $timeStr';
+        return '$type $timeStr$advanceText$disabledText';
     }
   }
 }
@@ -198,10 +303,45 @@ class ForecastDay {
   factory ForecastDay.fromJson(Map<String, dynamic> json) => ForecastDay(
         date:
             DateTime.tryParse(json['date']?.toString() ?? '') ?? DateTime.now(),
-        code: json['code'] ?? 0,
-        minTemp: (json['min_temp'] as num?)?.toDouble(),
-        maxTemp: (json['max_temp'] as num?)?.toDouble(),
+        code: intValue(json['code'], 0),
+        minTemp: doubleValue(json['min_temp'] ?? json['min']),
+        maxTemp: doubleValue(json['max_temp'] ?? json['max']),
       );
+}
+
+String stringValue(dynamic value, String fallback) {
+  if (value == null) return fallback;
+  if (value is String) return value;
+  if (value is Map) {
+    for (final key in ['name', 'display', 'city', 'regionName']) {
+      final nested = value[key];
+      if (nested != null && nested.toString().trim().isNotEmpty) {
+        return nested.toString();
+      }
+    }
+    return fallback;
+  }
+  final text = value.toString();
+  return text.trim().isEmpty ? fallback : text;
+}
+
+int intValue(dynamic value, int fallback) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  return int.tryParse(value?.toString() ?? '') ?? fallback;
+}
+
+double? doubleValue(dynamic value) {
+  if (value is num) return value.toDouble();
+  return double.tryParse(value?.toString() ?? '');
+}
+
+dynamic nestedWeatherValue(Map<String, dynamic> json, String key) {
+  final direct = json[key];
+  if (direct != null) return direct;
+  final location = json['location'];
+  if (location is Map) return location[key];
+  return null;
 }
 
 class WeatherInfo {
@@ -240,13 +380,13 @@ class WeatherInfo {
       };
 
   factory WeatherInfo.fromJson(Map<String, dynamic> json) => WeatherInfo(
-        location: json['location'] ?? '天气加载中',
-        display: json['display'] ?? '天气加载中',
-        icon: json['icon'] ?? '○',
-        latitude: (json['latitude'] as num?)?.toDouble(),
-        longitude: (json['longitude'] as num?)?.toDouble(),
-        temperature: (json['temperature'] as num?)?.toDouble(),
-        code: json['code'],
+        location: stringValue(json['location'], '天气加载中'),
+        display: stringValue(json['display'], '天气加载中'),
+        icon: stringValue(json['icon'], '○'),
+        latitude: doubleValue(nestedWeatherValue(json, 'latitude')),
+        longitude: doubleValue(nestedWeatherValue(json, 'longitude')),
+        temperature: doubleValue(json['temperature']),
+        code: json['code'] == null ? null : intValue(json['code'], 0),
         updatedAt: DateTime.tryParse(json['updated_at']?.toString() ?? ''),
         forecast: (json['forecast'] as List? ?? [])
             .whereType<Map>()
@@ -279,8 +419,543 @@ class WeatherInfo {
 }
 
 // ===================== 存储服务 =====================
+const String syncEncryptedMagic = 'yuran_calendar_webdav_sync';
+const String syncPayloadMagic = 'yuran_calendar_sync_payload';
+const int syncEncryptedVersion = 1;
+const String syncEncryptedMethod = 'pbkdf2-sha256+aes-256-gcm';
+const int syncKdfIterations = 390000;
+const String syncDefaultRemotePath = 'yuran-calendar-sync.json';
+const List<int> syncAad = [
+  121,
+  117,
+  114,
+  97,
+  110,
+  45,
+  99,
+  97,
+  108,
+  101,
+  110,
+  100,
+  97,
+  114,
+  45,
+  115,
+  121,
+  110,
+  99,
+  45,
+  118,
+  49,
+];
+
+String utcNowIso() {
+  final now = DateTime.now().toUtc();
+  return DateTime.utc(
+          now.year, now.month, now.day, now.hour, now.minute, now.second)
+      .toIso8601String();
+}
+
+DateTime parseSyncTime(String? value) {
+  if (value == null || value.trim().isEmpty) {
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+  return DateTime.tryParse(value)?.toUtc() ??
+      DateTime.fromMillisecondsSinceEpoch(0);
+}
+
+String scheduleText(dynamic item) {
+  if (item is Map) {
+    return (item['text'] ?? item['content'] ?? '').toString().trim();
+  }
+  return item?.toString().trim() ?? '';
+}
+
+bool scheduleDone(dynamic item) => item is Map && item['done'] == true;
+
+String scheduleDisplayText(dynamic item) {
+  final text = scheduleText(item);
+  if (text.isEmpty) return scheduleDone(item) ? '已办 未命名日程' : '未命名日程';
+  return scheduleDone(item) ? '已办 $text' : text;
+}
+
+DateTime scheduleSortTime(String dateKey, dynamic item) {
+  final base = DateTime.tryParse(dateKey) ?? DateTime(9999, 12, 31);
+  final text = scheduleText(item);
+  final match = RegExp(r'^(\d{1,2}):(\d{2})').firstMatch(text);
+  if (match == null) return base;
+  final hour = int.tryParse(match.group(1) ?? '') ?? 0;
+  final minute = int.tryParse(match.group(2) ?? '') ?? 0;
+  return DateTime(base.year, base.month, base.day, hour, minute);
+}
+
+String scheduleDateLabel(String dateKey) {
+  final date = DateTime.tryParse(dateKey);
+  if (date == null) return dateKey;
+  return '${date.month}月${date.day}日 ${weekdayText(date)}';
+}
+
+dynamic scheduleWithDone(dynamic item, bool done) {
+  final text = scheduleText(item);
+  if (item is Map) {
+    return {
+      ...Map<String, dynamic>.from(item),
+      'text': text,
+      'done': done,
+    };
+  }
+  return {
+    'text': text,
+    'done': done,
+  };
+}
+
+dynamic scheduleWithText(dynamic item, String text) {
+  if (item is Map) {
+    return {
+      ...Map<String, dynamic>.from(item),
+      'text': text.trim(),
+      'done': scheduleDone(item),
+    };
+  }
+  return {
+    'text': text.trim(),
+    'done': false,
+  };
+}
+
+class ScheduleParts {
+  final String hour;
+  final String minute;
+  final String content;
+
+  const ScheduleParts({
+    required this.hour,
+    required this.minute,
+    required this.content,
+  });
+}
+
+ScheduleParts parseScheduleParts(dynamic item, DateTime fallback) {
+  final text = scheduleText(item);
+  final match = RegExp(r'^\s*(\d{1,2}):(\d{2})\s*(.*)$').firstMatch(text);
+  if (match == null) {
+    return ScheduleParts(
+      hour: fallback.hour.toString().padLeft(2, '0'),
+      minute: fallback.minute.toString().padLeft(2, '0'),
+      content: text,
+    );
+  }
+  final hour = (int.tryParse(match.group(1) ?? '') ?? fallback.hour)
+      .clamp(0, 23)
+      .toString()
+      .padLeft(2, '0');
+  final minute = (int.tryParse(match.group(2) ?? '') ?? fallback.minute)
+      .clamp(0, 59)
+      .toString()
+      .padLeft(2, '0');
+  return ScheduleParts(
+    hour: hour,
+    minute: minute,
+    content: (match.group(3) ?? '').trim(),
+  );
+}
+
+int scheduleItemCount(Map<String, List<dynamic>> schedules) {
+  var count = 0;
+  for (final items in schedules.values) {
+    count += items.length;
+  }
+  return count;
+}
+
+String syncDataSummary(Map<String, dynamic> data) {
+  final reminders = data['reminders'];
+  final reminderCount = reminders is List ? reminders.length : 0;
+  var scheduleCount = 0;
+  final schedules = data['schedules'];
+  if (schedules is Map) {
+    for (final items in schedules.values) {
+      if (items is List) scheduleCount += items.length;
+    }
+  }
+  return '提醒 $reminderCount 条，日程 $scheduleCount 条';
+}
+
+bool syncDataHasUserContent(Map<String, dynamic> data) {
+  if ((data['content'] ?? '').toString().trim().isNotEmpty) return true;
+  if (syncDataHasPlanningContent(data)) return true;
+  return false;
+}
+
+bool syncDataHasPlanningContent(Map<String, dynamic> data) {
+  final reminders = data['reminders'];
+  if (reminders is List && reminders.isNotEmpty) return true;
+  final schedules = data['schedules'];
+  if (schedules is Map) {
+    for (final items in schedules.values) {
+      if (items is List && items.isNotEmpty) return true;
+    }
+  }
+  return false;
+}
+
+Map<String, List<dynamic>> parseSchedules(dynamic value) {
+  final result = <String, List<dynamic>>{};
+  if (value is! Map) return result;
+  value.forEach((key, items) {
+    if (items is List) {
+      result[key.toString()] = items
+          .map((item) => item is Map ? Map<String, dynamic>.from(item) : item)
+          .toList();
+    }
+  });
+  return result;
+}
+
+const Set<String> knownDataKeys = {
+  'content',
+  'color',
+  'show_calendar',
+  'show_clock',
+  'clock_style',
+  'weather',
+  'reminders',
+  'schedules',
+  '_sync_meta',
+};
+
+Map<String, dynamic> extraTopLevelData(Map<String, dynamic> data) {
+  final extra = Map<String, dynamic>.from(data);
+  for (final key in knownDataKeys) {
+    extra.remove(key);
+  }
+  return extra;
+}
+
+class SyncConfig {
+  final bool enabled;
+  final String serverUrl;
+  final String username;
+  final String password;
+  final String remotePath;
+  final String syncPassword;
+  final bool autoSync;
+  final String deviceId;
+  final String lastSyncAt;
+  final String lastSyncedUpdatedAt;
+
+  const SyncConfig({
+    this.enabled = false,
+    this.serverUrl = '',
+    this.username = '',
+    this.password = '',
+    this.remotePath = syncDefaultRemotePath,
+    this.syncPassword = '',
+    this.autoSync = false,
+    this.deviceId = '',
+    this.lastSyncAt = '',
+    this.lastSyncedUpdatedAt = '',
+  });
+
+  factory SyncConfig.fromJson(Map<String, dynamic> json) => SyncConfig(
+        enabled: json['enabled'] == true,
+        serverUrl: (json['server_url'] ?? '').toString().trim(),
+        username: (json['username'] ?? '').toString().trim(),
+        password: (json['password'] ?? '').toString(),
+        remotePath:
+            (json['remote_path'] ?? syncDefaultRemotePath).toString().trim(),
+        syncPassword: (json['sync_password'] ?? '').toString(),
+        autoSync: json['auto_sync'] == true,
+        deviceId: (json['device_id'] ?? '').toString().trim(),
+        lastSyncAt: (json['last_sync_at'] ?? '').toString(),
+        lastSyncedUpdatedAt: (json['last_synced_updated_at'] ?? '').toString(),
+      ).normalized();
+
+  SyncConfig normalized() => SyncConfig(
+        enabled: enabled,
+        serverUrl: serverUrl.trim(),
+        username: username.trim(),
+        password: password,
+        remotePath: remotePath.trim().isEmpty
+            ? syncDefaultRemotePath
+            : remotePath.trim(),
+        syncPassword: syncPassword,
+        autoSync: autoSync,
+        deviceId: deviceId.trim().isEmpty
+            ? DateTime.now().microsecondsSinceEpoch.toRadixString(16)
+            : deviceId.trim(),
+        lastSyncAt: lastSyncAt,
+        lastSyncedUpdatedAt: lastSyncedUpdatedAt,
+      );
+
+  bool get isReady =>
+      serverUrl.trim().isNotEmpty &&
+      username.trim().isNotEmpty &&
+      password.isNotEmpty &&
+      syncPassword.isNotEmpty &&
+      serverUrl.trim().toLowerCase().startsWith(RegExp(r'https?://'));
+
+  Map<String, dynamic> toJson() => {
+        'enabled': enabled,
+        'server_url': serverUrl.trim(),
+        'username': username.trim(),
+        'password': password,
+        'remote_path':
+            remotePath.trim().isEmpty ? syncDefaultRemotePath : remotePath,
+        'sync_password': syncPassword,
+        'auto_sync': autoSync,
+        'device_id': deviceId,
+        'last_sync_at': lastSyncAt,
+        'last_synced_updated_at': lastSyncedUpdatedAt,
+      };
+
+  SyncConfig copyWith({
+    bool? enabled,
+    String? serverUrl,
+    String? username,
+    String? password,
+    String? remotePath,
+    String? syncPassword,
+    bool? autoSync,
+    String? deviceId,
+    String? lastSyncAt,
+    String? lastSyncedUpdatedAt,
+  }) =>
+      SyncConfig(
+        enabled: enabled ?? this.enabled,
+        serverUrl: serverUrl ?? this.serverUrl,
+        username: username ?? this.username,
+        password: password ?? this.password,
+        remotePath: remotePath ?? this.remotePath,
+        syncPassword: syncPassword ?? this.syncPassword,
+        autoSync: autoSync ?? this.autoSync,
+        deviceId: deviceId ?? this.deviceId,
+        lastSyncAt: lastSyncAt ?? this.lastSyncAt,
+        lastSyncedUpdatedAt: lastSyncedUpdatedAt ?? this.lastSyncedUpdatedAt,
+      ).normalized();
+}
+
+class WebDavSyncService {
+  static final math.Random _random = math.Random.secure();
+
+  static List<int> _randomBytes(int length) =>
+      List<int>.generate(length, (_) => _random.nextInt(256));
+
+  static void validateConfig(SyncConfig config) {
+    if (config.serverUrl.trim().isEmpty) throw Exception('请填写 WebDAV 地址');
+    if (!config.serverUrl
+        .trim()
+        .toLowerCase()
+        .startsWith(RegExp(r'https?://'))) {
+      throw Exception('WebDAV 地址必须以 http:// 或 https:// 开头');
+    }
+    if (config.username.trim().isEmpty) throw Exception('请填写 WebDAV 账号');
+    if (config.password.isEmpty) throw Exception('请填写 WebDAV 应用密码');
+    if (config.syncPassword.isEmpty) throw Exception('请填写同步密码');
+  }
+
+  static List<String> _pathSegments(String path) => path
+      .replaceAll('\\', '/')
+      .split('/')
+      .map((s) => s.trim())
+      .where((s) => s.isNotEmpty)
+      .toList();
+
+  static Uri fileUri(SyncConfig config, [String? path]) {
+    final base = config.serverUrl.trim().replaceFirst(RegExp(r'/+$'), '');
+    final segments = _pathSegments(path ?? config.remotePath);
+    final encodedPath = segments.isEmpty
+        ? syncDefaultRemotePath
+        : segments.map(Uri.encodeComponent).join('/');
+    return Uri.parse('$base/$encodedPath');
+  }
+
+  static String _authHeader(SyncConfig config) {
+    final raw = utf8.encode('${config.username}:${config.password}');
+    return 'Basic ${base64Encode(raw)}';
+  }
+
+  static Future<(int, List<int>)> _request(
+    String method,
+    Uri uri,
+    SyncConfig config, {
+    List<int>? body,
+    Map<String, String> headers = const {},
+    Set<int> allowedStatuses = const {200, 201, 204, 207},
+  }) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final req = await client.openUrl(method, uri);
+      req.headers.set(HttpHeaders.userAgentHeader, 'YuranCalendar/1.0');
+      req.headers.set(HttpHeaders.authorizationHeader, _authHeader(config));
+      headers.forEach(req.headers.set);
+      if (body != null) {
+        req.headers.contentType = ContentType.json;
+        req.add(body);
+      }
+      final resp = await req.close().timeout(const Duration(seconds: 15));
+      final bytes = await resp.fold<List<int>>(<int>[], (a, b) => a..addAll(b));
+      if (!allowedStatuses.contains(resp.statusCode)) {
+        throw HttpException('WebDAV 请求失败：HTTP ${resp.statusCode}', uri: uri);
+      }
+      return (resp.statusCode, bytes);
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  static Future<void> testConnection(SyncConfig config) async {
+    validateConfig(config);
+    final base = Uri.parse(
+        '${config.serverUrl.trim().replaceFirst(RegExp(r'/+$'), '')}/');
+    await _request(
+      'PROPFIND',
+      base,
+      config,
+      headers: {'Depth': '0'},
+      allowedStatuses: {200, 207},
+    );
+  }
+
+  static Future<void> _ensureParentDirs(SyncConfig config) async {
+    final base = config.serverUrl.trim().replaceFirst(RegExp(r'/+$'), '');
+    final segments = _pathSegments(config.remotePath);
+    var current = base;
+    for (final segment in segments.take(math.max(segments.length - 1, 0))) {
+      current = '$current/${Uri.encodeComponent(segment)}';
+      await _request(
+        'MKCOL',
+        Uri.parse(current),
+        config,
+        allowedStatuses: {200, 201, 204, 405},
+      );
+    }
+  }
+
+  static Future<Map<String, dynamic>> encryptPackage(
+    Map<String, dynamic> data,
+    String password,
+    String deviceId,
+  ) async {
+    final syncData = Map<String, dynamic>.from(data)..remove('sync');
+    final meta = syncData['_sync_meta'];
+    final updatedAt = meta is Map && meta['updated_at'] != null
+        ? meta['updated_at'].toString()
+        : utcNowIso();
+    final payload = {
+      'magic': syncPayloadMagic,
+      'version': syncEncryptedVersion,
+      'updated_at': updatedAt,
+      'device_id': deviceId,
+      'data': syncData,
+    };
+    final salt = _randomBytes(16);
+    final nonce = _randomBytes(12);
+    final key = await Pbkdf2(
+      macAlgorithm: Hmac.sha256(),
+      iterations: syncKdfIterations,
+      bits: 256,
+    ).deriveKey(
+      secretKey: SecretKey(utf8.encode(password)),
+      nonce: salt,
+    );
+    final box = await AesGcm.with256bits().encrypt(
+      utf8.encode(jsonEncode(payload)),
+      secretKey: key,
+      nonce: nonce,
+      aad: syncAad,
+    );
+    final encryptedBytes = <int>[...box.cipherText, ...box.mac.bytes];
+    return {
+      'magic': syncEncryptedMagic,
+      'version': syncEncryptedVersion,
+      'encrypted': true,
+      'method': syncEncryptedMethod,
+      'kdf': {
+        'name': 'PBKDF2-HMAC-SHA256',
+        'iterations': syncKdfIterations,
+        'salt': base64Encode(salt),
+      },
+      'cipher': {
+        'name': 'AES-256-GCM',
+        'nonce': base64Encode(nonce),
+      },
+      'updated_at': updatedAt,
+      'device_id': deviceId,
+      'payload': base64Encode(encryptedBytes),
+    };
+  }
+
+  static Future<Map<String, dynamic>> decryptPackage(
+    Map<String, dynamic> envelope,
+    String password,
+  ) async {
+    if (envelope['magic'] != syncEncryptedMagic ||
+        envelope['method'] != syncEncryptedMethod) {
+      throw Exception('云端文件不是支持的雨然日历同步文件');
+    }
+    final kdf = Map<String, dynamic>.from(envelope['kdf'] as Map);
+    final cipher = Map<String, dynamic>.from(envelope['cipher'] as Map);
+    final salt = base64Decode(kdf['salt'].toString());
+    final nonce = base64Decode(cipher['nonce'].toString());
+    final encryptedBytes = base64Decode(envelope['payload'].toString());
+    if (encryptedBytes.length <= 16) throw Exception('同步文件内容无效');
+    final cipherText = encryptedBytes.sublist(0, encryptedBytes.length - 16);
+    final mac = Mac(encryptedBytes.sublist(encryptedBytes.length - 16));
+    final iterations = int.tryParse(kdf['iterations'].toString()) ?? 0;
+    final key = await Pbkdf2(
+      macAlgorithm: Hmac.sha256(),
+      iterations: iterations,
+      bits: 256,
+    ).deriveKey(
+      secretKey: SecretKey(utf8.encode(password)),
+      nonce: salt,
+    );
+    final plain = await AesGcm.with256bits().decrypt(
+      SecretBox(cipherText, nonce: nonce, mac: mac),
+      secretKey: key,
+      aad: syncAad,
+    );
+    final payload = jsonDecode(utf8.decode(plain));
+    if (payload is! Map || payload['magic'] != syncPayloadMagic) {
+      throw Exception('同步文件内容无效');
+    }
+    return Map<String, dynamic>.from(payload);
+  }
+
+  static Future<void> upload(
+    SyncConfig config,
+    Map<String, dynamic> envelope,
+  ) async {
+    await _ensureParentDirs(config);
+    await _request(
+      'PUT',
+      fileUri(config),
+      config,
+      body: utf8.encode(jsonEncode(envelope)),
+      allowedStatuses: {200, 201, 204},
+    );
+  }
+
+  static Future<Map<String, dynamic>?> download(SyncConfig config) async {
+    final (status, bytes) = await _request(
+      'GET',
+      fileUri(config),
+      config,
+      allowedStatuses: {200, 404},
+    );
+    if (status == 404) return null;
+    return Map<String, dynamic>.from(jsonDecode(utf8.decode(bytes)) as Map);
+  }
+}
+
 class StorageService {
   static late File _dataFile;
+  static late File _syncConfigFile;
+  static late Directory _appDir;
   static const MethodChannel _channel =
       MethodChannel('com.example.sticky_android/alarm');
 
@@ -300,7 +975,10 @@ class StorageService {
     } else {
       path = Directory.systemTemp.path;
     }
+    _appDir = Directory(path);
+    _appDir.createSync(recursive: true);
     _dataFile = File('$path/sticky_notes.json');
+    _syncConfigFile = File('$path/sync_config.json');
   }
 
   static Future<Map<String, dynamic>> load() async {
@@ -323,6 +1001,47 @@ class StorageService {
       debugPrint('Save error: $e');
       return false;
     }
+  }
+
+  static Future<SyncConfig> loadSyncConfig() async {
+    try {
+      if (await _syncConfigFile.exists()) {
+        final content = await _syncConfigFile.readAsString();
+        return SyncConfig.fromJson(
+          Map<String, dynamic>.from(jsonDecode(content) as Map),
+        );
+      }
+    } catch (e) {
+      debugPrint('Load sync config error: $e');
+    }
+    return const SyncConfig().normalized();
+  }
+
+  static Future<bool> saveSyncConfig(SyncConfig config) async {
+    try {
+      await _syncConfigFile.writeAsString(
+        jsonEncode(config.normalized().toJson()),
+        flush: true,
+      );
+      return true;
+    } catch (e) {
+      debugPrint('Save sync config error: $e');
+      return false;
+    }
+  }
+
+  static Future<String> writeConflictBackup(
+    String source,
+    Map<String, dynamic> data,
+  ) async {
+    final stamp = DateTime.now()
+        .toIso8601String()
+        .replaceAll(':', '')
+        .replaceAll('.', '-');
+    final path = '${_appDir.path}/sync-conflict-$source-$stamp.json';
+    final file = File(path);
+    await file.writeAsString(jsonEncode(data), flush: true);
+    return path;
   }
 }
 
@@ -944,6 +1663,8 @@ List<Reminder> importantRemindersForDate(
 ) {
   final lunar = LunarCalendar.solarToLunar(date.year, date.month, date.day);
   return reminders.where((r) {
+    if (!r.enabled) return false;
+    if (r.type == 'once' && r.done) return false;
     switch (r.type) {
       case 'once':
         if (r.isLunar) {
@@ -954,6 +1675,10 @@ List<Reminder> importantRemindersForDate(
         return r.year == date.year &&
             r.month == date.month &&
             r.day == date.day;
+      case 'daily':
+        return true;
+      case 'weekly':
+        return r.weekday == date.weekday - 1;
       case 'monthly':
         return r.monthlyDay == date.day;
       case 'yearly':
@@ -985,7 +1710,11 @@ class _StickyAppState extends State<StickyApp> {
   WeatherInfo weatherInfo = const WeatherInfo();
   bool weatherRefreshing = false;
   List<Reminder> reminders = [];
-  Map<String, List<String>> schedules = {};
+  Map<String, List<dynamic>> schedules = {};
+  Map<String, dynamic> extraData = {};
+  Map<String, dynamic> syncMeta = {};
+  SyncConfig syncConfig = const SyncConfig();
+  bool syncBusy = false;
   int calYear = DateTime.now().year;
   int calMonth = DateTime.now().month;
   Timer? _reminderTimer;
@@ -1026,6 +1755,8 @@ class _StickyAppState extends State<StickyApp> {
     final todayKey = '${now.year}-${now.month}-${now.day}';
 
     for (final r in reminders) {
+      if (!r.enabled) continue;
+      if (r.type == 'once' && r.done) continue;
       if (r.hour != now.hour || r.minute != now.minute) continue;
 
       final triggerKey = '${r.type}_${r.displayLabel}_$todayKey';
@@ -1163,6 +1894,7 @@ class _StickyAppState extends State<StickyApp> {
   Future<void> _loadData() async {
     await StorageService.init();
     final data = await StorageService.load();
+    final loadedSyncConfig = await StorageService.loadSyncConfig();
     setState(() {
       noteContent = data['content'] ?? '';
       currentColor = data['color'] ?? 'yellow';
@@ -1180,21 +1912,38 @@ class _StickyAppState extends State<StickyApp> {
             .toList();
       }
       if (data['schedules'] != null) {
-        schedules = Map<String, List<String>>.from(
-          (data['schedules'] as Map).map(
-            (k, v) => MapEntry(k.toString(), List<String>.from(v)),
-          ),
-        );
+        schedules = parseSchedules(data['schedules']);
       }
+      syncMeta = data['_sync_meta'] is Map
+          ? Map<String, dynamic>.from(data['_sync_meta'] as Map)
+          : {};
+      extraData = extraTopLevelData(Map<String, dynamic>.from(data));
+      syncConfig = loadedSyncConfig;
     });
     // 启动时重新设置原生闹钟（开机重启后需要）
     await _scheduleNativeAlarms();
     await _syncWidgetWeather();
     await _refreshWeather();
+    if (syncConfig.autoSync && syncConfig.isReady) {
+      Future.delayed(
+        const Duration(seconds: 2),
+        () => _syncNow(showSuccess: false),
+      );
+    }
   }
 
-  Future<bool> _saveData() async {
-    final data = {
+  void _touchSyncMeta() {
+    syncMeta = {
+      ...syncMeta,
+      'updated_at': utcNowIso(),
+      'device_id': syncConfig.deviceId,
+    };
+  }
+
+  Map<String, dynamic> _currentData({bool touchSyncMeta = false}) {
+    if (touchSyncMeta) _touchSyncMeta();
+    return {
+      ...extraData,
       'content': noteContent,
       'color': currentColor,
       'show_calendar': showCalendar,
@@ -1203,11 +1952,38 @@ class _StickyAppState extends State<StickyApp> {
       'weather': weatherInfo.toJson(),
       'reminders': reminders.map((r) => r.toJson()).toList(),
       'schedules': schedules,
+      '_sync_meta': syncMeta,
     };
+  }
+
+  Future<bool> _saveData({bool touchSyncMeta = true}) async {
+    final data = _currentData(touchSyncMeta: touchSyncMeta);
     final result = await StorageService.save(data);
     await _scheduleNativeAlarms();
     await _syncWidgetWeather();
     return result;
+  }
+
+  void _applyLoadedData(Map<String, dynamic> data) {
+    setState(() {
+      noteContent = data['content'] ?? '';
+      currentColor = data['color'] ?? 'yellow';
+      showCalendar = data['show_calendar'] ?? true;
+      showClock = data['show_clock'] ?? false;
+      clockStyle = data['clock_style'] == 'digital' ? 'digital' : 'analog';
+      weatherInfo = data['weather'] is Map
+          ? WeatherInfo.fromJson(Map<String, dynamic>.from(data['weather']))
+          : const WeatherInfo();
+      reminders = (data['reminders'] as List? ?? [])
+          .whereType<Map>()
+          .map((r) => Reminder.fromJson(Map<String, dynamic>.from(r)))
+          .toList();
+      schedules = parseSchedules(data['schedules']);
+      syncMeta = data['_sync_meta'] is Map
+          ? Map<String, dynamic>.from(data['_sync_meta'] as Map)
+          : {};
+      extraData = extraTopLevelData(data);
+    });
   }
 
   Future<void> _syncWidgetWeather() async {
@@ -1227,6 +2003,8 @@ class _StickyAppState extends State<StickyApp> {
       // 过滤出 Android 原生侧支持的提醒类型
       final supportedReminders = reminders
           .where((r) =>
+              r.enabled &&
+              !(r.type == 'once' && r.done) &&
               ['once', 'daily', 'weekly', 'monthly', 'yearly'].contains(r.type))
           .toList();
       final jsonData =
@@ -1332,6 +2110,535 @@ class _StickyAppState extends State<StickyApp> {
     }
   }
 
+  Future<bool> _saveSyncConfig(SyncConfig config) async {
+    final normalized = config.normalized();
+    final ok = await StorageService.saveSyncConfig(normalized);
+    if (ok && mounted) setState(() => syncConfig = normalized);
+    return ok;
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<String> _uploadSnapshot(
+    Map<String, dynamic> snapshot,
+    SyncConfig config,
+  ) async {
+    final envelope = await WebDavSyncService.encryptPackage(
+      snapshot,
+      config.syncPassword,
+      config.deviceId,
+    );
+    await WebDavSyncService.upload(config, envelope);
+    return envelope['updated_at'].toString();
+  }
+
+  Future<void> _markSyncSuccess(SyncConfig config, String? updatedAt) async {
+    final next = config.copyWith(
+      enabled: true,
+      lastSyncAt: utcNowIso(),
+      lastSyncedUpdatedAt: updatedAt ?? '',
+    );
+    await _saveSyncConfig(next);
+  }
+
+  Future<String> _testConnectionForDialog(SyncConfig config) async {
+    WebDavSyncService.validateConfig(config);
+    final saved = await _saveSyncConfig(config);
+    if (!saved) throw Exception('配置保存失败');
+    await WebDavSyncService.testConnection(config);
+    await _saveSyncConfig(config.copyWith(enabled: true));
+    return 'WebDAV 连接测试成功，配置已保存';
+  }
+
+  Future<String> _syncForDialog(SyncConfig config) async {
+    WebDavSyncService.validateConfig(config);
+    final saved = await _saveSyncConfig(config);
+    if (!saved) throw Exception('配置保存失败');
+
+    final snapshot = _currentData(touchSyncMeta: false);
+    await StorageService.save(snapshot);
+    final remoteEnvelope = await WebDavSyncService.download(config);
+    final localUpdated =
+        (snapshot['_sync_meta'] as Map?)?['updated_at']?.toString() ?? '';
+
+    if (remoteEnvelope == null) {
+      final uploadedAt = await _uploadSnapshot(snapshot, config);
+      await _markSyncSuccess(config, uploadedAt);
+      return '云端无数据，已上传本机数据';
+    }
+
+    final remotePayload = await WebDavSyncService.decryptPackage(
+      remoteEnvelope,
+      config.syncPassword,
+    );
+    final remoteData = Map<String, dynamic>.from(remotePayload['data'] as Map);
+    final remoteUpdated = remotePayload['updated_at']?.toString() ??
+        ((remoteData['_sync_meta'] as Map?)?['updated_at']?.toString() ?? '');
+    final localTime = parseSyncTime(localUpdated);
+    final remoteTime = parseSyncTime(remoteUpdated);
+    final lastTime = parseSyncTime(config.lastSyncedUpdatedAt);
+    final localHasUserContent = syncDataHasUserContent(snapshot);
+    final remoteHasUserContent = syncDataHasUserContent(remoteData);
+    final localHasPlanningContent = syncDataHasPlanningContent(snapshot);
+    final remoteHasPlanningContent = syncDataHasPlanningContent(remoteData);
+
+    if (config.lastSyncedUpdatedAt.trim().isEmpty ||
+        (!localHasUserContent && remoteHasUserContent) ||
+        (!localHasPlanningContent && remoteHasPlanningContent)) {
+      await StorageService.writeConflictBackup('local', snapshot);
+      _applyLoadedData(remoteData);
+      await _saveData(touchSyncMeta: false);
+      await _markSyncSuccess(config, remoteUpdated);
+      final summary = syncDataSummary(remoteData);
+      if (config.lastSyncedUpdatedAt.trim().isEmpty) {
+        return '首次同步已下载云端数据，本机旧数据已备份（$summary）';
+      }
+      return !localHasPlanningContent && remoteHasPlanningContent
+          ? '本机暂无提醒/日程，已下载云端数据并备份本机旧数据（$summary）'
+          : '本机暂无便签/提醒/日程，已下载云端数据并备份本机旧数据（$summary）';
+    }
+
+    if (localUpdated == remoteUpdated) {
+      await _markSyncSuccess(config, localUpdated);
+      return '本机和云端已经一致';
+    }
+
+    if (lastTime.millisecondsSinceEpoch > 0 &&
+        localTime.isAfter(lastTime) &&
+        remoteTime.isAfter(lastTime)) {
+      await StorageService.writeConflictBackup('local', snapshot);
+      await StorageService.writeConflictBackup('cloud', remoteData);
+      return '检测到同步冲突，已备份本机和云端数据。请手动选择“上传本机”或“下载云端”。';
+    }
+
+    if (remoteTime.isAfter(localTime)) {
+      await StorageService.writeConflictBackup('local', snapshot);
+      _applyLoadedData(remoteData);
+      await _saveData(touchSyncMeta: false);
+      await _markSyncSuccess(config, remoteUpdated);
+      return '云端数据较新，已下载云端数据并备份本机旧数据（${syncDataSummary(remoteData)}）';
+    }
+
+    final uploadedAt = await _uploadSnapshot(snapshot, config);
+    await _markSyncSuccess(config, uploadedAt);
+    return '本机数据较新，已上传到云端';
+  }
+
+  Future<String> _uploadForDialog(SyncConfig config) async {
+    WebDavSyncService.validateConfig(config);
+    final saved = await _saveSyncConfig(config);
+    if (!saved) throw Exception('配置保存失败');
+
+    final snapshot = _currentData(touchSyncMeta: true);
+    await StorageService.save(snapshot);
+    final remoteEnvelope = await WebDavSyncService.download(config);
+    if (remoteEnvelope != null) {
+      final remotePayload = await WebDavSyncService.decryptPackage(
+        remoteEnvelope,
+        config.syncPassword,
+      );
+      await StorageService.writeConflictBackup(
+        'cloud',
+        Map<String, dynamic>.from(remotePayload['data'] as Map),
+      );
+    }
+    final uploadedAt = await _uploadSnapshot(snapshot, config);
+    await _markSyncSuccess(config, uploadedAt);
+    return '已上传本机数据到云端';
+  }
+
+  Future<String> _downloadForDialog(SyncConfig config) async {
+    WebDavSyncService.validateConfig(config);
+    final saved = await _saveSyncConfig(config);
+    if (!saved) throw Exception('配置保存失败');
+
+    final snapshot = _currentData(touchSyncMeta: false);
+    final remoteEnvelope = await WebDavSyncService.download(config);
+    if (remoteEnvelope == null) throw Exception('云端还没有同步文件');
+    final remotePayload = await WebDavSyncService.decryptPackage(
+      remoteEnvelope,
+      config.syncPassword,
+    );
+    await StorageService.writeConflictBackup('local', snapshot);
+    final remoteData = Map<String, dynamic>.from(remotePayload['data'] as Map);
+    _applyLoadedData(remoteData);
+    await _saveData(touchSyncMeta: false);
+    await _markSyncSuccess(config, remotePayload['updated_at']?.toString());
+    return '已下载云端数据，本机旧数据已备份（${syncDataSummary(remoteData)}）';
+  }
+
+  Future<void> _syncNow({bool showSuccess = true}) async {
+    final config = syncConfig.normalized();
+    if (!config.isReady) {
+      if (showSuccess) _showSnack('请先配置 WebDAV 云同步');
+      return;
+    }
+    setState(() => syncBusy = true);
+    try {
+      final snapshot = _currentData(touchSyncMeta: false);
+      await StorageService.save(snapshot);
+      final remoteEnvelope = await WebDavSyncService.download(config);
+      final localUpdated =
+          (snapshot['_sync_meta'] as Map?)?['updated_at']?.toString() ?? '';
+
+      if (remoteEnvelope == null) {
+        final uploadedAt = await _uploadSnapshot(snapshot, config);
+        await _markSyncSuccess(config, uploadedAt);
+        if (showSuccess) _showSnack('云端无数据，已上传本机数据');
+        return;
+      }
+
+      final remotePayload = await WebDavSyncService.decryptPackage(
+        remoteEnvelope,
+        config.syncPassword,
+      );
+      final remoteData =
+          Map<String, dynamic>.from(remotePayload['data'] as Map);
+      final remoteUpdated = remotePayload['updated_at']?.toString() ??
+          ((remoteData['_sync_meta'] as Map?)?['updated_at']?.toString() ?? '');
+      final localTime = parseSyncTime(localUpdated);
+      final remoteTime = parseSyncTime(remoteUpdated);
+      final lastTime = parseSyncTime(config.lastSyncedUpdatedAt);
+      final localHasUserContent = syncDataHasUserContent(snapshot);
+      final remoteHasUserContent = syncDataHasUserContent(remoteData);
+      final localHasPlanningContent = syncDataHasPlanningContent(snapshot);
+      final remoteHasPlanningContent = syncDataHasPlanningContent(remoteData);
+
+      if (config.lastSyncedUpdatedAt.trim().isEmpty ||
+          (!localHasUserContent && remoteHasUserContent) ||
+          (!localHasPlanningContent && remoteHasPlanningContent)) {
+        await StorageService.writeConflictBackup('local', snapshot);
+        _applyLoadedData(remoteData);
+        await _saveData(touchSyncMeta: false);
+        await _markSyncSuccess(config, remoteUpdated);
+        if (showSuccess) {
+          final summary = syncDataSummary(remoteData);
+          if (config.lastSyncedUpdatedAt.trim().isEmpty) {
+            _showSnack('首次同步已下载云端数据（$summary）');
+          } else if (!localHasPlanningContent && remoteHasPlanningContent) {
+            _showSnack('本机暂无提醒/日程，已下载云端数据（$summary）');
+          } else {
+            _showSnack('本机暂无便签/提醒/日程，已下载云端数据（$summary）');
+          }
+        }
+        return;
+      }
+
+      if (localUpdated == remoteUpdated) {
+        await _markSyncSuccess(config, localUpdated);
+        if (showSuccess) _showSnack('本机和云端已经一致');
+        return;
+      }
+
+      if (lastTime.millisecondsSinceEpoch > 0 &&
+          localTime.isAfter(lastTime) &&
+          remoteTime.isAfter(lastTime)) {
+        if (!mounted) return;
+        final downloadCloud = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('同步冲突'),
+            content: const Text(
+              '检测到本机和云端都修改过。\n\n选择“下载云端”会先备份本机；选择“上传本机”会先备份云端。',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('上传本机'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('下载云端'),
+              ),
+            ],
+          ),
+        );
+        if (downloadCloud == true) {
+          await StorageService.writeConflictBackup('local', snapshot);
+          _applyLoadedData(remoteData);
+          await _saveData(touchSyncMeta: false);
+          await _markSyncSuccess(config, remoteUpdated);
+          _showSnack('已下载云端数据，本机旧数据已备份（${syncDataSummary(remoteData)}）');
+        } else if (downloadCloud == false) {
+          await StorageService.writeConflictBackup('cloud', remoteData);
+          final uploadedAt = await _uploadSnapshot(snapshot, config);
+          await _markSyncSuccess(config, uploadedAt);
+          _showSnack('已上传本机数据，云端旧数据已备份');
+        }
+        return;
+      }
+
+      if (remoteTime.isAfter(localTime)) {
+        if (!mounted) return;
+        final ok = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('云端数据较新'),
+            content: const Text('是否先备份本机数据，然后下载云端数据覆盖本机？'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('下载云端'),
+              ),
+            ],
+          ),
+        );
+        if (ok == true) {
+          await StorageService.writeConflictBackup('local', snapshot);
+          _applyLoadedData(remoteData);
+          await _saveData(touchSyncMeta: false);
+          await _markSyncSuccess(config, remoteUpdated);
+          _showSnack('已下载云端数据，本机旧数据已备份（${syncDataSummary(remoteData)}）');
+        }
+        return;
+      }
+
+      final uploadedAt = await _uploadSnapshot(snapshot, config);
+      await _markSyncSuccess(config, uploadedAt);
+      if (showSuccess) _showSnack('本机数据较新，已上传到云端');
+    } catch (e) {
+      if (showSuccess) _showSnack('同步失败：$e');
+    } finally {
+      if (mounted) setState(() => syncBusy = false);
+    }
+  }
+
+  Future<void> _showSyncDialog(BuildContext pageContext) async {
+    final serverCtrl = TextEditingController(text: syncConfig.serverUrl);
+    final userCtrl = TextEditingController(text: syncConfig.username);
+    final passCtrl = TextEditingController(text: syncConfig.password);
+    final remoteCtrl = TextEditingController(text: syncConfig.remotePath);
+    final syncPassCtrl = TextEditingController(text: syncConfig.syncPassword);
+    var enabled = syncConfig.enabled;
+    var autoSync = syncConfig.autoSync;
+    var dialogBusy = false;
+    var statusText = syncConfig.isReady ? '当前：已配置' : '当前：未配置';
+
+    SyncConfig gather() => syncConfig.copyWith(
+          enabled: enabled,
+          serverUrl: serverCtrl.text.trim(),
+          username: userCtrl.text.trim(),
+          password: passCtrl.text,
+          remotePath: remoteCtrl.text.trim().isEmpty
+              ? syncDefaultRemotePath
+              : remoteCtrl.text.trim(),
+          syncPassword: syncPassCtrl.text,
+          autoSync: autoSync,
+        );
+
+    Future<void> runDialogOperation(
+      void Function(void Function()) setDialogState,
+      String runningText,
+      Future<String> Function(SyncConfig) operation,
+    ) async {
+      FocusScope.of(pageContext).unfocus();
+      setDialogState(() {
+        dialogBusy = true;
+        statusText = runningText;
+      });
+      try {
+        final result = await operation(gather());
+        statusText = result;
+      } catch (e) {
+        statusText = e.toString().replaceFirst('Exception: ', '');
+      } finally {
+        dialogBusy = false;
+        if (mounted) {
+          setDialogState(() {});
+        }
+      }
+    }
+
+    await showDialog<void>(
+      context: pageContext,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('WebDAV 云同步'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: serverCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'WebDAV 地址',
+                    hintText: 'https://example.com/dav/',
+                  ),
+                ),
+                TextField(
+                  controller: userCtrl,
+                  decoration: const InputDecoration(labelText: '账号'),
+                ),
+                TextField(
+                  controller: passCtrl,
+                  obscureText: true,
+                  decoration: const InputDecoration(labelText: '应用密码'),
+                ),
+                TextField(
+                  controller: remoteCtrl,
+                  decoration: const InputDecoration(
+                    labelText: '远程文件',
+                    hintText: syncDefaultRemotePath,
+                  ),
+                ),
+                TextField(
+                  controller: syncPassCtrl,
+                  obscureText: true,
+                  decoration: const InputDecoration(labelText: '同步密码'),
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  value: enabled,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('启用云同步'),
+                  onChanged: (v) => setDialogState(() => enabled = v ?? false),
+                ),
+                CheckboxListTile(
+                  value: autoSync,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('启动时自动同步'),
+                  onChanged: (v) => setDialogState(() => autoSync = v ?? false),
+                ),
+                const Text(
+                  '同步密码用于跨设备解密，忘记后无法恢复云端数据。Android 配置保存在应用私有目录。',
+                  style: TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    statusText,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: statusText.contains('失败') ||
+                              statusText.contains('请填写')
+                          ? Colors.red
+                          : Colors.grey[700],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: (syncBusy || dialogBusy)
+                        ? null
+                        : () async {
+                            setDialogState(() {
+                              dialogBusy = true;
+                              statusText = '正在保存配置...';
+                            });
+                            try {
+                              final next = gather();
+                              final ok = await _saveSyncConfig(next);
+                              statusText = ok ? '配置已保存' : '保存失败';
+                            } catch (e) {
+                              statusText = e
+                                  .toString()
+                                  .replaceFirst('Exception: ', '保存失败：');
+                            } finally {
+                              dialogBusy = false;
+                              if (ctx.mounted) setDialogState(() {});
+                            }
+                          },
+                    icon: const Icon(Icons.save_outlined),
+                    label: const Text('保存配置'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: (syncBusy || dialogBusy)
+                        ? null
+                        : () async {
+                            await runDialogOperation(
+                              setDialogState,
+                              '正在测试连接...',
+                              _testConnectionForDialog,
+                            );
+                          },
+                    icon: const Icon(Icons.network_check),
+                    label: const Text('测试连接'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: (syncBusy || dialogBusy)
+                        ? null
+                        : () async {
+                            await runDialogOperation(
+                              setDialogState,
+                              '正在同步...',
+                              _syncForDialog,
+                            );
+                          },
+                    icon: const Icon(Icons.cloud_sync),
+                    label: Text((syncBusy || dialogBusy) ? '处理中' : '立即同步'),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: (syncBusy || dialogBusy)
+                            ? null
+                            : () async {
+                                await runDialogOperation(
+                                  setDialogState,
+                                  '正在上传本机数据...',
+                                  _uploadForDialog,
+                                );
+                              },
+                        icon: const Icon(Icons.upload),
+                        label: const Text('上传本机'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: (syncBusy || dialogBusy)
+                            ? null
+                            : () async {
+                                await runDialogOperation(
+                                  setDialogState,
+                                  '正在下载云端数据...',
+                                  _downloadForDialog,
+                                );
+                              },
+                        icon: const Icon(Icons.download),
+                        label: const Text('下载云端'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed:
+                  (syncBusy || dialogBusy) ? null : () => Navigator.pop(ctx),
+              child: const Text('关闭'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = theme;
@@ -1368,6 +2675,9 @@ class _StickyAppState extends State<StickyApp> {
         onSetWeatherLocation: _setWeatherLocation,
         onSelectClockStyle: _selectClockStyle,
         onPinClockWidget: _pinClockWidget,
+        onOpenSyncSettings: _showSyncDialog,
+        syncBusy: syncBusy,
+        syncReady: syncConfig.isReady,
         calYear: calYear,
         calMonth: calMonth,
         onChangeMonth: (delta) {
@@ -1388,7 +2698,13 @@ class _StickyAppState extends State<StickyApp> {
           setState(() => reminders.add(r));
           _saveData();
         },
+        onUpdateReminder: (idx, r) {
+          if (idx < 0 || idx >= reminders.length) return;
+          setState(() => reminders[idx] = r);
+          _saveData();
+        },
         onDeleteReminder: (idx) {
+          if (idx < 0 || idx >= reminders.length) return;
           setState(() => reminders.removeAt(idx));
           _saveData();
         },
@@ -1396,6 +2712,21 @@ class _StickyAppState extends State<StickyApp> {
           setState(() {
             schedules.putIfAbsent(dateKey, () => []);
             schedules[dateKey]!.add(item);
+          });
+          _saveData();
+        },
+        onUpdateSchedule: (dateKey, index, item) {
+          final items = schedules[dateKey];
+          if (items == null || index < 0 || index >= items.length) return;
+          setState(() => items[index] = item);
+          _saveData();
+        },
+        onDeleteSchedule: (dateKey, index) {
+          final items = schedules[dateKey];
+          if (items == null || index < 0 || index >= items.length) return;
+          setState(() {
+            items.removeAt(index);
+            if (items.isEmpty) schedules.remove(dateKey);
           });
           _saveData();
         },
@@ -1421,14 +2752,20 @@ class HomeScreen extends StatefulWidget {
   final Future<bool> Function(String) onSetWeatherLocation;
   final ValueChanged<String> onSelectClockStyle;
   final Future<bool> Function(String) onPinClockWidget;
+  final Future<void> Function(BuildContext) onOpenSyncSettings;
+  final bool syncBusy;
+  final bool syncReady;
   final int calYear;
   final int calMonth;
   final ValueChanged<int> onChangeMonth;
   final List<Reminder> reminders;
-  final Map<String, List<String>> schedules;
+  final Map<String, List<dynamic>> schedules;
   final ValueChanged<Reminder> onAddReminder;
+  final void Function(int, Reminder) onUpdateReminder;
   final ValueChanged<int> onDeleteReminder;
-  final void Function(String, String) onAddSchedule;
+  final void Function(String, dynamic) onAddSchedule;
+  final void Function(String, int, dynamic) onUpdateSchedule;
+  final void Function(String, int) onDeleteSchedule;
 
   const HomeScreen({
     super.key,
@@ -1447,14 +2784,20 @@ class HomeScreen extends StatefulWidget {
     required this.onSetWeatherLocation,
     required this.onSelectClockStyle,
     required this.onPinClockWidget,
+    required this.onOpenSyncSettings,
+    required this.syncBusy,
+    required this.syncReady,
     required this.calYear,
     required this.calMonth,
     required this.onChangeMonth,
     required this.reminders,
     required this.schedules,
     required this.onAddReminder,
+    required this.onUpdateReminder,
     required this.onDeleteReminder,
     required this.onAddSchedule,
+    required this.onUpdateSchedule,
+    required this.onDeleteSchedule,
   });
 
   @override
@@ -1478,6 +2821,216 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<bool> _confirmAction(
+    BuildContext context,
+    String title,
+    String content,
+  ) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(content),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确定'),
+          ),
+        ],
+      ),
+    );
+    return ok == true;
+  }
+
+  Widget _toolbarButton({
+    required String tooltip,
+    required IconData icon,
+    required Color color,
+    required VoidCallback? onPressed,
+    double extent = 30,
+  }) {
+    return IconButton(
+      tooltip: tooltip,
+      visualDensity: VisualDensity.compact,
+      iconSize: 20,
+      padding: EdgeInsets.zero,
+      constraints: BoxConstraints(minWidth: extent, minHeight: extent),
+      color: color,
+      onPressed: onPressed,
+      icon: Icon(icon),
+    );
+  }
+
+  Widget _reminderListButton(Color fg, double extent) {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        _toolbarButton(
+          tooltip: '提醒列表',
+          icon: Icons.notifications_outlined,
+          color: fg,
+          extent: extent,
+          onPressed: () => _showRemindersList(context),
+        ),
+        if (widget.reminders.isNotEmpty)
+          Positioned(
+            right: 1,
+            top: 1,
+            child: Container(
+              constraints: const BoxConstraints(minWidth: 15),
+              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE53935),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Text(
+                widget.reminders.length > 99
+                    ? '99+'
+                    : widget.reminders.length.toString(),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  height: 1,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _scheduleListButton(Color fg, double extent) {
+    final count = scheduleItemCount(widget.schedules);
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        _toolbarButton(
+          tooltip: '日程列表',
+          icon: Icons.event_note_outlined,
+          color: fg,
+          extent: extent,
+          onPressed: () => _showSchedulesList(context),
+        ),
+        if (count > 0)
+          Positioned(
+            right: 1,
+            top: 1,
+            child: Container(
+              constraints: const BoxConstraints(minWidth: 15),
+              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1976D2),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Text(
+                count > 99 ? '99+' : count.toString(),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  height: 1,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildTopBar(Color bg, Color fg) {
+    return Container(
+      color: bg,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 360;
+          final extent = compact ? 28.0 : 30.0;
+          final tools = Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _toolbarButton(
+                tooltip: '日历',
+                icon: Icons.calendar_month,
+                color: fg,
+                extent: extent,
+                onPressed: widget.onToggleCalendar,
+              ),
+              _toolbarButton(
+                tooltip: '颜色',
+                icon: Icons.palette_outlined,
+                color: fg,
+                extent: extent,
+                onPressed: widget.onCycleColor,
+              ),
+              _toolbarButton(
+                tooltip: '时钟',
+                icon: Icons.schedule,
+                color: fg,
+                extent: extent,
+                onPressed: () => _showClockMenu(context),
+              ),
+              _toolbarButton(
+                tooltip: '云同步',
+                icon: widget.syncBusy ? Icons.cloud_sync : Icons.cloud_outlined,
+                color: widget.syncReady
+                    ? const Color(0xFF1976D2)
+                    : fg.withAlpha(170),
+                extent: compact ? 27 : 28,
+                onPressed: widget.syncBusy
+                    ? null
+                    : () => widget.onOpenSyncSettings(context),
+              ),
+              _toolbarButton(
+                tooltip: '添加提醒',
+                icon: Icons.add_alert_outlined,
+                color: fg,
+                extent: extent,
+                onPressed: () => _showAddReminderDialog(context),
+              ),
+              _scheduleListButton(fg, extent),
+              _reminderListButton(fg, extent),
+            ],
+          );
+
+          return Row(
+            children: [
+              Image.asset('assets/images/logo.png', width: 24, height: 24),
+              if (!compact) ...[
+                const SizedBox(width: 8),
+                Text(
+                  '雨然日历',
+                  style: TextStyle(
+                    color: fg,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+              const SizedBox(width: 8),
+              Expanded(
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerRight,
+                    child: tools,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final t = widget.theme;
@@ -1489,52 +3042,7 @@ class _HomeScreenState extends State<HomeScreen> {
       body: SafeArea(
         child: Column(
           children: [
-            // 标题栏
-            Container(
-              color: bg,
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              child: Row(
-                children: [
-                  Image.asset('assets/images/logo.png', width: 24, height: 24),
-                  const SizedBox(width: 8),
-                  Text('雨然日历',
-                      style: TextStyle(
-                          color: fg,
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold)),
-                  const Spacer(),
-                  GestureDetector(
-                    onTap: widget.onToggleCalendar,
-                    child:
-                        Text('日历', style: TextStyle(color: fg, fontSize: 14)),
-                  ),
-                  const SizedBox(width: 16),
-                  GestureDetector(
-                    onTap: widget.onCycleColor,
-                    child:
-                        Text('颜色', style: TextStyle(color: fg, fontSize: 14)),
-                  ),
-                  const SizedBox(width: 16),
-                  GestureDetector(
-                    onTap: () => _showClockMenu(context),
-                    child:
-                        Text('时钟', style: TextStyle(color: fg, fontSize: 14)),
-                  ),
-                  const SizedBox(width: 16),
-                  GestureDetector(
-                    onTap: () => _showAddReminderDialog(context),
-                    child: Text('[+提醒]',
-                        style: TextStyle(color: fg, fontSize: 14)),
-                  ),
-                  const SizedBox(width: 12),
-                  GestureDetector(
-                    onTap: () => _showRemindersList(context),
-                    child: Text('提醒(${widget.reminders.length})',
-                        style: TextStyle(color: fg, fontSize: 14)),
-                  ),
-                ],
-              ),
-            ),
+            _buildTopBar(bg, fg),
 
             _buildInfoWeatherBar(context, bg, fg),
 
@@ -1662,69 +3170,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _handleDateTap(BuildContext context, int year, int month, int day) {
-    final date = DateTime(year, month, day);
-    final hits = importantRemindersForDate(widget.reminders, date);
-    if (hits.isNotEmpty) {
-      _showDateReminders(context, date, hits);
-    } else {
-      _showDateMenu(context, year, month, day);
-    }
-  }
-
-  void _showDateReminders(
-      BuildContext context, DateTime date, List<Reminder> reminders) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('${date.year}年${date.month}月${date.day}日'),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: reminders
-                .map(
-                  (r) => Container(
-                    width: double.infinity,
-                    margin: const EdgeInsets.only(bottom: 8),
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFFF5F5),
-                      border: Border.all(color: const Color(0xFFF3B7B7)),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          r.displayLabel,
-                          style: const TextStyle(
-                            color: Color(0xFFE53935),
-                            fontWeight: FontWeight.bold,
-                            fontSize: 12,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(r.message, style: const TextStyle(fontSize: 15)),
-                      ],
-                    ),
-                  ),
-                )
-                .toList(),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(ctx);
-              _showDateMenu(context, date.year, date.month, date.day);
-            },
-            child: const Text('添加/日程'),
-          ),
-          TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('关闭')),
-        ],
-      ),
-    );
+    _showDateMenu(context, year, month, day);
   }
 
   void _showWeatherForecast(BuildContext context) {
@@ -1947,71 +3393,344 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  void _showSchedulesList(BuildContext context) {
+    final entries = <({String dateKey, int index, dynamic item})>[];
+    widget.schedules.forEach((dateKey, items) {
+      for (var index = 0; index < items.length; index++) {
+        entries.add((dateKey: dateKey, index: index, item: items[index]));
+      }
+    });
+    final now = DateTime.now();
+    entries.sort((a, b) {
+      final aTime = scheduleSortTime(a.dateKey, a.item);
+      final bTime = scheduleSortTime(b.dateKey, b.item);
+      final aBucket = scheduleDone(a.item)
+          ? 2
+          : aTime.isBefore(now)
+              ? 1
+              : 0;
+      final bBucket = scheduleDone(b.item)
+          ? 2
+          : bTime.isBefore(now)
+              ? 1
+              : 0;
+      if (aBucket != bBucket) return aBucket.compareTo(bBucket);
+      return aBucket == 0 ? aTime.compareTo(bTime) : bTime.compareTo(aTime);
+    });
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('日程列表 (${entries.length})'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: entries.isEmpty
+              ? const Text('暂无日程', style: TextStyle(color: Colors.grey))
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: entries.length,
+                  itemBuilder: (context, i) {
+                    final entry = entries[i];
+                    final done = scheduleDone(entry.item);
+                    return ListTile(
+                      dense: true,
+                      leading: Checkbox(
+                        value: done,
+                        onChanged: (value) {
+                          widget.onUpdateSchedule(
+                            entry.dateKey,
+                            entry.index,
+                            scheduleWithDone(entry.item, value ?? false),
+                          );
+                          Navigator.pop(ctx);
+                          _showSchedulesList(context);
+                        },
+                      ),
+                      title: Text(
+                        scheduleDisplayText(entry.item),
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: done ? Colors.grey : null,
+                          decoration: done ? TextDecoration.lineThrough : null,
+                        ),
+                      ),
+                      subtitle: Text(scheduleDateLabel(entry.dateKey)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            tooltip: '编辑',
+                            icon: const Icon(Icons.edit_outlined),
+                            onPressed: () {
+                              final date = DateTime.tryParse(entry.dateKey);
+                              if (date == null) return;
+                              Navigator.pop(ctx);
+                              _showAddScheduleDialog(
+                                context,
+                                date.year,
+                                date.month,
+                                date.day,
+                                editIndex: entry.index,
+                                initialItem: entry.item,
+                              );
+                            },
+                          ),
+                          IconButton(
+                            tooltip: '删除',
+                            icon: const Icon(Icons.delete_outline),
+                            color: Colors.red,
+                            onPressed: () async {
+                              final ok = await _confirmAction(
+                                context,
+                                '删除日程',
+                                scheduleDisplayText(entry.item),
+                              );
+                              if (!ok || !ctx.mounted) return;
+                              widget.onDeleteSchedule(
+                                entry.dateKey,
+                                entry.index,
+                              );
+                              Navigator.pop(ctx);
+                              _showSchedulesList(context);
+                            },
+                          ),
+                        ],
+                      ),
+                      onTap: () {
+                        final date = DateTime.tryParse(entry.dateKey);
+                        if (date == null) return;
+                        Navigator.pop(ctx);
+                        _showDateMenu(context, date.year, date.month, date.day);
+                      },
+                    );
+                  },
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              final today = DateTime.now();
+              Navigator.pop(ctx);
+              _showAddScheduleDialog(
+                context,
+                today.year,
+                today.month,
+                today.day,
+              );
+            },
+            child: const Text('添加今日日程'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showDateMenu(BuildContext context, int year, int month, int day) {
     final dateStr = '$year年$month月$day日';
     final dateKey =
         '${year.toString().padLeft(4, '0')}-${month.toString().padLeft(2, '0')}-${day.toString().padLeft(2, '0')}';
+    final date = DateTime(year, month, day);
+    final reminders = importantRemindersForDate(widget.reminders, date);
+    final daySchedules = widget.schedules[dateKey] ?? [];
 
     showModalBottomSheet(
       context: context,
       builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(dateStr,
-                  style: const TextStyle(
-                      fontSize: 16, fontWeight: FontWeight.bold)),
-            ),
-            ListTile(
-              leading: const Icon(Icons.notifications),
-              title: const Text('添加提醒'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _showAddReminderDialog(context,
-                    prefillYear: year, prefillMonth: month, prefillDay: day);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.event),
-              title: const Text('添加日程'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _showAddScheduleDialog(context, year, month, day);
-              },
-            ),
-            if (widget.schedules.containsKey(dateKey) &&
-                widget.schedules[dateKey]!.isNotEmpty) ...[
-              const Divider(),
-              const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Text('已有日程',
-                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(dateStr,
+                    style: const TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.bold)),
               ),
-              ...widget.schedules[dateKey]!.map((item) => ListTile(
+              ListTile(
+                leading: const Icon(Icons.notifications),
+                title: const Text('添加提醒'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showAddReminderDialog(context,
+                      prefillYear: year, prefillMonth: month, prefillDay: day);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.event),
+                title: const Text('添加日程'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showAddScheduleDialog(context, year, month, day);
+                },
+              ),
+              if (reminders.isNotEmpty) ...[
+                const Divider(),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Text('已有提醒',
+                      style: TextStyle(color: Colors.grey, fontSize: 12)),
+                ),
+                ...reminders.map((r) {
+                  final reminderIndex = widget.reminders.indexOf(r);
+                  return ListTile(
                     dense: true,
-                    title: Text(item, style: const TextStyle(fontSize: 14)),
-                  )),
+                    leading: Icon(
+                      r.enabled
+                          ? Icons.notifications_outlined
+                          : Icons.notifications_off_outlined,
+                      color: r.enabled ? const Color(0xFFE53935) : Colors.grey,
+                    ),
+                    title: Text(
+                      r.message.isEmpty ? '未命名提醒' : r.message,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: r.enabled ? null : Colors.grey,
+                      ),
+                    ),
+                    subtitle: Text(r.displayLabel),
+                    trailing: reminderIndex < 0
+                        ? null
+                        : PopupMenuButton<String>(
+                            onSelected: (action) async {
+                              Navigator.pop(ctx);
+                              if (action == 'toggle') {
+                                widget.onUpdateReminder(
+                                  reminderIndex,
+                                  r.copyWith(
+                                    enabled: !r.enabled,
+                                    clearLastTriggered: true,
+                                  ),
+                                );
+                              } else if (action == 'edit') {
+                                _showAddReminderDialog(
+                                  context,
+                                  editIndex: reminderIndex,
+                                  initialReminder: r,
+                                );
+                              } else if (action == 'delete') {
+                                final ok = await _confirmAction(
+                                  context,
+                                  '删除提醒',
+                                  r.message.isEmpty
+                                      ? r.displayLabel
+                                      : r.message,
+                                );
+                                if (ok) widget.onDeleteReminder(reminderIndex);
+                              }
+                            },
+                            itemBuilder: (context) => [
+                              const PopupMenuItem(
+                                value: 'edit',
+                                child: Text('编辑'),
+                              ),
+                              PopupMenuItem(
+                                value: 'toggle',
+                                child: Text(r.enabled ? '停用' : '启用'),
+                              ),
+                              const PopupMenuItem(
+                                value: 'delete',
+                                child: Text('删除'),
+                              ),
+                            ],
+                          ),
+                  );
+                }),
+              ],
+              if (daySchedules.isNotEmpty) ...[
+                const Divider(),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Text('已有日程',
+                      style: TextStyle(color: Colors.grey, fontSize: 12)),
+                ),
+                ...daySchedules.asMap().entries.map((entry) {
+                  final index = entry.key;
+                  final item = entry.value;
+                  final done = scheduleDone(item);
+                  return ListTile(
+                    dense: true,
+                    leading: Checkbox(
+                      value: done,
+                      onChanged: (value) {
+                        widget.onUpdateSchedule(
+                          dateKey,
+                          index,
+                          scheduleWithDone(item, value ?? false),
+                        );
+                        Navigator.pop(ctx);
+                      },
+                    ),
+                    title: Text(
+                      scheduleDisplayText(item),
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: done ? Colors.grey : null,
+                        decoration: done ? TextDecoration.lineThrough : null,
+                      ),
+                    ),
+                    trailing: PopupMenuButton<String>(
+                      onSelected: (action) async {
+                        Navigator.pop(ctx);
+                        if (action == 'edit') {
+                          _showAddScheduleDialog(
+                            context,
+                            year,
+                            month,
+                            day,
+                            editIndex: index,
+                            initialItem: item,
+                          );
+                        } else if (action == 'delete') {
+                          final ok = await _confirmAction(
+                            context,
+                            '删除日程',
+                            scheduleDisplayText(item),
+                          );
+                          if (ok) widget.onDeleteSchedule(dateKey, index);
+                        }
+                      },
+                      itemBuilder: (context) => const [
+                        PopupMenuItem(value: 'edit', child: Text('编辑')),
+                        PopupMenuItem(value: 'delete', child: Text('删除')),
+                      ],
+                    ),
+                  );
+                }),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
   }
 
   void _showAddScheduleDialog(
-      BuildContext context, int year, int month, int day) {
-    final contentCtrl = TextEditingController();
+    BuildContext context,
+    int year,
+    int month,
+    int day, {
+    int? editIndex,
+    dynamic initialItem,
+  }) {
     final now = DateTime.now();
-    String selectedHour = now.hour.toString().padLeft(2, '0');
-    String selectedMinute = now.minute.toString().padLeft(2, '0');
+    final isEditing = editIndex != null;
+    final parts = parseScheduleParts(initialItem, now);
+    final contentCtrl =
+        TextEditingController(text: isEditing ? parts.content : '');
+    String selectedHour =
+        isEditing ? parts.hour : now.hour.toString().padLeft(2, '0');
+    String selectedMinute =
+        isEditing ? parts.minute : now.minute.toString().padLeft(2, '0');
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
-          title: Text('$year年$month月$day日'),
+          title: Text(isEditing ? '编辑日程' : '$year年$month月$day日'),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -2064,10 +3783,18 @@ class _HomeScreenState extends State<HomeScreen> {
                     (h.isNotEmpty && m.isNotEmpty) ? '$h:$m $content' : content;
                 final dateKey =
                     '${year.toString().padLeft(4, '0')}-${month.toString().padLeft(2, '0')}-${day.toString().padLeft(2, '0')}';
-                widget.onAddSchedule(dateKey, item);
+                if (isEditing) {
+                  widget.onUpdateSchedule(
+                    dateKey,
+                    editIndex,
+                    scheduleWithText(initialItem, item),
+                  );
+                } else {
+                  widget.onAddSchedule(dateKey, item);
+                }
                 Navigator.pop(ctx);
               },
-              child: const Text('确定'),
+              child: Text(isEditing ? '保存' : '确定'),
             ),
           ],
         ),
@@ -2075,35 +3802,75 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  void _showAddReminderDialog(BuildContext context,
-      {int? prefillYear, int? prefillMonth, int? prefillDay}) {
+  void _showAddReminderDialog(
+    BuildContext context, {
+    int? prefillYear,
+    int? prefillMonth,
+    int? prefillDay,
+    int? editIndex,
+    Reminder? initialReminder,
+  }) {
     final now = DateTime.now();
     final typeItems = ['单次', '每天', '每周', '每月', '每年', '每年农历', '每月农历'];
-    String selectedType = '单次';
-    final msgCtrl = TextEditingController();
-    String selectedYear = (prefillYear ?? now.year).toString();
-    String selectedMonth = (prefillMonth ?? now.month).toString();
-    String selectedDay = (prefillDay ?? now.day).toString();
-    String selectedHour = now.hour.toString().padLeft(2, '0');
-    String selectedMinute = now.minute.toString().padLeft(2, '0');
+    const typeLabels = {
+      'once': '单次',
+      'daily': '每天',
+      'weekly': '每周',
+      'monthly': '每月',
+      'yearly': '每年',
+      'lunar_yearly': '每年农历',
+      'lunar_monthly': '每月农历',
+    };
+    final isEditing = editIndex != null && initialReminder != null;
+    String selectedType = typeLabels[initialReminder?.type] ?? '单次';
+    final msgCtrl = TextEditingController(text: initialReminder?.message ?? '');
+    final initialYear = initialReminder?.year ?? prefillYear ?? now.year;
+    final initialMonth = initialReminder?.month ?? prefillMonth ?? now.month;
+    final initialDay = initialReminder?.day ?? prefillDay ?? now.day;
+    String selectedYear = initialYear.toString();
+    String selectedMonth = initialMonth.toString();
+    String selectedDay = initialDay.toString();
+    String selectedHour =
+        (initialReminder?.hour ?? now.hour).toString().padLeft(2, '0');
+    String selectedMinute =
+        (initialReminder?.minute ?? now.minute).toString().padLeft(2, '0');
 
-    bool isLunar = false;
+    bool isLunar = initialReminder?.isLunar ?? false;
 
     // 每周
     final weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
-    String selectedWeekday = weekdays[now.weekday - 1];
+    final initialWeekday =
+        (initialReminder?.weekday ?? (now.weekday - 1)).clamp(0, 6);
+    String selectedWeekday = weekdays[initialWeekday];
 
     // 每月
-    String selectedMonthDay = (prefillDay ?? now.day).toString();
+    String selectedMonthDay =
+        (initialReminder?.monthlyDay ?? initialReminder?.day ?? initialDay)
+            .toString();
 
     // 每年
-    String selectedYearMonth = (prefillMonth ?? now.month).toString();
-    String selectedYearDay = (prefillDay ?? now.day).toString();
+    String selectedYearMonth =
+        (initialReminder?.yearlyMonth ?? initialReminder?.month ?? initialMonth)
+            .toString();
+    String selectedYearDay =
+        (initialReminder?.yearlyDay ?? initialReminder?.day ?? initialDay)
+            .toString();
 
     // 农历
     int prefillLunarMonth = now.month;
     int prefillLunarDay = now.day;
-    if (prefillYear != null && prefillMonth != null && prefillDay != null) {
+    if (initialReminder?.lunarMonth != null) {
+      prefillLunarMonth = initialReminder!.lunarMonth!;
+    }
+    if (initialReminder?.lunarDay != null) {
+      prefillLunarDay = initialReminder!.lunarDay!;
+    } else if (initialReminder?.isLunar == true &&
+        initialReminder?.month != null) {
+      prefillLunarMonth = initialReminder!.month!;
+      prefillLunarDay = initialReminder.day ?? prefillLunarDay;
+    } else if (prefillYear != null &&
+        prefillMonth != null &&
+        prefillDay != null) {
       final lunar =
           LunarCalendar.solarToLunar(prefillYear, prefillMonth, prefillDay);
       prefillLunarMonth = lunar['month'];
@@ -2112,6 +3879,8 @@ class _HomeScreenState extends State<HomeScreen> {
     String selectedLunarMonth = prefillLunarMonth.toString();
     String selectedLunarDay = prefillLunarDay.toString();
     String selectedLunarMonthlyDay = prefillLunarDay.toString();
+    final firstYear = math.min(now.year - 10, initialYear);
+    final yearCount = math.max(21, (initialYear - now.year).abs() + 11).toInt();
 
     showDialog(
       context: context,
@@ -2128,8 +3897,8 @@ class _HomeScreenState extends State<HomeScreen> {
                           child: DropdownButtonFormField<String>(
                             value: selectedYear,
                             decoration: const InputDecoration(labelText: '年'),
-                            items: List.generate(
-                                    11, (i) => (now.year - 5 + i).toString())
+                            items: List.generate(yearCount,
+                                    (i) => (firstYear + i).toString())
                                 .map((y) => DropdownMenuItem(
                                     value: y, child: Text('$y年')))
                                 .toList(),
@@ -2268,7 +4037,7 @@ class _HomeScreenState extends State<HomeScreen> {
           }
 
           return AlertDialog(
-            title: const Text('添加提醒'),
+            title: Text(isEditing ? '编辑提醒' : '添加提醒'),
             content: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -2397,11 +4166,24 @@ class _HomeScreenState extends State<HomeScreen> {
                   }
 
                   if (reminder != null) {
-                    widget.onAddReminder(reminder);
+                    if (isEditing) {
+                      final original = initialReminder;
+                      widget.onUpdateReminder(
+                        editIndex,
+                        reminder.copyWith(
+                          enabled: original.enabled,
+                          done: false,
+                          extra: original.extra,
+                          clearLastTriggered: true,
+                        ),
+                      );
+                    } else {
+                      widget.onAddReminder(reminder);
+                    }
                   }
                   Navigator.pop(ctx);
                 },
-                child: const Text('确定'),
+                child: Text(isEditing ? '保存' : '确定'),
               ),
             ],
           );
@@ -2426,18 +4208,74 @@ class _HomeScreenState extends State<HomeScreen> {
                     final r = widget.reminders[i];
                     return ListTile(
                       dense: true,
+                      leading: Icon(
+                        r.enabled
+                            ? Icons.notifications_outlined
+                            : Icons.notifications_off_outlined,
+                        color:
+                            r.enabled ? const Color(0xFFE53935) : Colors.grey,
+                      ),
                       title: Text(r.displayLabel,
-                          style: const TextStyle(fontSize: 13)),
-                      subtitle:
-                          Text(r.message, style: const TextStyle(fontSize: 12)),
-                      trailing: TextButton(
-                        onPressed: () {
-                          widget.onDeleteReminder(i);
-                          Navigator.pop(ctx);
-                          _showRemindersList(context);
-                        },
-                        child: const Text('删除',
-                            style: TextStyle(color: Colors.red, fontSize: 12)),
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: r.enabled ? null : Colors.grey,
+                          )),
+                      subtitle: Text(
+                        r.message.isEmpty ? '未命名提醒' : r.message,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: r.enabled ? null : Colors.grey,
+                        ),
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            tooltip: '编辑',
+                            icon: const Icon(Icons.edit_outlined),
+                            onPressed: () {
+                              Navigator.pop(ctx);
+                              _showAddReminderDialog(
+                                context,
+                                editIndex: i,
+                                initialReminder: r,
+                              );
+                            },
+                          ),
+                          IconButton(
+                            tooltip: r.enabled ? '停用' : '启用',
+                            icon: Icon(r.enabled
+                                ? Icons.pause_circle_outline
+                                : Icons.play_circle_outline),
+                            onPressed: () {
+                              widget.onUpdateReminder(
+                                i,
+                                r.copyWith(
+                                  enabled: !r.enabled,
+                                  clearLastTriggered: true,
+                                ),
+                              );
+                              Navigator.pop(ctx);
+                              _showRemindersList(context);
+                            },
+                          ),
+                          IconButton(
+                            tooltip: '删除',
+                            icon: const Icon(Icons.delete_outline),
+                            color: Colors.red,
+                            onPressed: () async {
+                              final ok = await _confirmAction(
+                                context,
+                                '删除提醒',
+                                r.message.isEmpty ? r.displayLabel : r.message,
+                              );
+                              if (!ok || !ctx.mounted) return;
+                              widget.onDeleteReminder(i);
+                              Navigator.pop(ctx);
+                              _showRemindersList(context);
+                            },
+                          ),
+                        ],
                       ),
                     );
                   },
@@ -2697,7 +4535,7 @@ class CalendarWidget extends StatelessWidget {
   final int month;
   final Map<String, dynamic> theme;
   final List<Reminder> reminders;
-  final Map<String, List<String>> schedules;
+  final Map<String, List<dynamic>> schedules;
   final ValueChanged<int> onChangeMonth;
   final void Function(int, int, int) onDateTap;
 
@@ -2868,82 +4706,96 @@ class CalendarWidget extends StatelessWidget {
                       ]
                     : null,
               ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
+              child: Stack(
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(
-                        '$day',
-                        style: TextStyle(
-                          color: dayFg,
-                          fontSize: 13,
-                          fontWeight: FontWeight.bold,
+                  if (hasReminder)
+                    Positioned(
+                      right: 5,
+                      top: 5,
+                      child: Container(
+                        width: 9,
+                        height: 9,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFE53935),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: isToday ? Colors.white : cellBg,
+                            width: 1.3,
+                          ),
                         ),
                       ),
-                      if (hasReminder)
-                        Container(
-                          width: 7,
-                          height: 7,
-                          margin: const EdgeInsets.only(left: 3, bottom: 8),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFE53935),
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: isToday ? Colors.white : cellBg,
-                              width: 1,
-                            ),
-                          ),
-                        ),
-                      if (dayTag != null)
-                        Container(
-                          margin: const EdgeInsets.only(left: 2),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 3, vertical: 0),
-                          decoration: BoxDecoration(
-                            color: dayTag == '班'
-                                ? const Color(0xFFD32F2F)
-                                : const Color(0xFF2E7D32),
-                            borderRadius: BorderRadius.circular(3),
-                          ),
-                          child: Text(
-                            dayTag,
-                            style: const TextStyle(
-                              fontSize: 8,
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              height: 1.2,
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                  if (holidayText != null)
-                    Text(
-                      holidayText,
-                      style: TextStyle(
-                        color: isLegal ? const Color(0xFFC62828) : holidayColor,
-                        fontSize: 9,
-                        fontWeight:
-                            isLegal ? FontWeight.bold : FontWeight.normal,
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    )
-                  else if (hasSchedule)
-                    Text(
-                      '·日程',
-                      style: TextStyle(
-                          color: todayColor,
-                          fontSize: 9,
-                          fontWeight: FontWeight.bold),
-                    )
-                  else
-                    Text(
-                      lunar['day'] == 1 ? lunar['monthText'] : lunar['dayText'],
-                      style: TextStyle(color: fg.withAlpha(180), fontSize: 9),
                     ),
+                  Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Text(
+                              '$day',
+                              style: TextStyle(
+                                color: dayFg,
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            if (dayTag != null)
+                              Container(
+                                margin: const EdgeInsets.only(left: 2),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 3, vertical: 0),
+                                decoration: BoxDecoration(
+                                  color: dayTag == '班'
+                                      ? const Color(0xFFD32F2F)
+                                      : const Color(0xFF2E7D32),
+                                  borderRadius: BorderRadius.circular(3),
+                                ),
+                                child: Text(
+                                  dayTag,
+                                  style: const TextStyle(
+                                    fontSize: 8,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    height: 1.2,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                        if (holidayText != null)
+                          Text(
+                            holidayText,
+                            style: TextStyle(
+                              color: isLegal
+                                  ? const Color(0xFFC62828)
+                                  : holidayColor,
+                              fontSize: 9,
+                              fontWeight:
+                                  isLegal ? FontWeight.bold : FontWeight.normal,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          )
+                        else if (hasSchedule)
+                          Text(
+                            '·日程',
+                            style: TextStyle(
+                                color: todayColor,
+                                fontSize: 9,
+                                fontWeight: FontWeight.bold),
+                          )
+                        else
+                          Text(
+                            lunar['day'] == 1
+                                ? lunar['monthText']
+                                : lunar['dayText'],
+                            style: TextStyle(
+                                color: fg.withAlpha(180), fontSize: 9),
+                          ),
+                      ],
+                    ),
+                  ),
                 ],
               ),
             ),
