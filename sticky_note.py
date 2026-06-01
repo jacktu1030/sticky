@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import messagebox, ttk, colorchooser, simpledialog
+from tkinter import messagebox, ttk, colorchooser, simpledialog, filedialog
+import base64
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ import subprocess
 import threading
 import time
 import ctypes
+from ctypes import wintypes
 import math
 import urllib.parse
 import urllib.request
@@ -37,6 +39,9 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 DATA_FILE = os.path.join(_app_dir(), "notes.json")
+ENCRYPTED_DATA_MAGIC = "yuran_calendar_encrypted"
+ENCRYPTED_DATA_VERSION = 1
+ENCRYPTED_DATA_METHOD = "windows-dpapi-current-user"
 WEATHER_UPDATE_INTERVAL_MS = 30 * 60 * 1000
 WEATHER_RETRY_INTERVAL_MS = 5 * 60 * 1000
 HTTP_TIMEOUT = 10
@@ -88,6 +93,15 @@ WEATHER_CODE_TEXT = {
 }
 
 WEATHER_ICON_DEFAULT = "○"
+REMINDER_ADVANCE_OPTIONS = [
+    ("准时", 0),
+    ("提前5分钟", 5),
+    ("提前10分钟", 10),
+    ("提前30分钟", 30),
+    ("提前1小时", 60),
+    ("提前1天", 24 * 60),
+]
+REMINDER_ADVANCE_LABEL_TO_MINUTES = dict(REMINDER_ADVANCE_OPTIONS)
 
 LUNAR_MONTHS = ["正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊"]
 LUNAR_DAYS = ["初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
@@ -323,6 +337,156 @@ def short_location_name(name):
     return name if len(name) <= limit else name[:limit]
 
 
+def safe_int(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_advance_minutes(reminder):
+    return max(0, safe_int(reminder.get("advance_minutes"), 0))
+
+
+def reminder_is_enabled(reminder):
+    return reminder.get("enabled", True) is not False
+
+
+def advance_minutes_to_label(minutes):
+    minutes = max(0, safe_int(minutes, 0))
+    for label, value in REMINDER_ADVANCE_OPTIONS:
+        if value == minutes:
+            return label
+    if minutes % (24 * 60) == 0:
+        return f"提前{minutes // (24 * 60)}天"
+    if minutes % 60 == 0:
+        return f"提前{minutes // 60}小时"
+    return f"提前{minutes}分钟"
+
+
+def advance_label_to_minutes(label):
+    return REMINDER_ADVANCE_LABEL_TO_MINUTES.get(label, 0)
+
+
+def format_reminder_time(hour, minute, advance_minutes=0):
+    time_text = f"{safe_int(hour):02d}:{safe_int(minute):02d}"
+    advance_minutes = max(0, safe_int(advance_minutes, 0))
+    if advance_minutes:
+        return f"{time_text}（{advance_minutes_to_label(advance_minutes)}）"
+    return time_text
+
+
+class DATA_BLOB(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _bytes_to_blob(data):
+    buffer = ctypes.create_string_buffer(data, len(data))
+    blob = DATA_BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    return blob, buffer
+
+
+def dpapi_encrypt(data):
+    if sys.platform != "win32":
+        raise RuntimeError("数据加密需要 Windows DPAPI")
+    in_blob, in_buffer = _bytes_to_blob(data)
+    out_blob = DATA_BLOB()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    ok = crypt32.CryptProtectData(
+        ctypes.byref(in_blob),
+        "雨然日历数据",
+        None,
+        None,
+        None,
+        0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
+def dpapi_decrypt(data):
+    if sys.platform != "win32":
+        raise RuntimeError("数据解密需要 Windows DPAPI")
+    in_blob, in_buffer = _bytes_to_blob(data)
+    out_blob = DATA_BLOB()
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    ok = crypt32.CryptUnprotectData(
+        ctypes.byref(in_blob),
+        None,
+        None,
+        None,
+        None,
+        0x01,  # CRYPTPROTECT_UI_FORBIDDEN
+        ctypes.byref(out_blob),
+    )
+    if not ok:
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
+def is_encrypted_data_envelope(value):
+    return (
+        isinstance(value, dict)
+        and value.get("magic") == ENCRYPTED_DATA_MAGIC
+        and value.get("encrypted") is True
+    )
+
+
+def make_encrypted_data_envelope(data):
+    plain = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    encrypted = dpapi_encrypt(plain)
+    return {
+        "magic": ENCRYPTED_DATA_MAGIC,
+        "version": ENCRYPTED_DATA_VERSION,
+        "encrypted": True,
+        "method": ENCRYPTED_DATA_METHOD,
+        "payload": base64.b64encode(encrypted).decode("ascii"),
+    }
+
+
+def decode_data_object(value):
+    if is_encrypted_data_envelope(value):
+        if value.get("method") != ENCRYPTED_DATA_METHOD:
+            raise ValueError("不支持的数据加密方式")
+        payload = base64.b64decode(value.get("payload", ""))
+        plain = dpapi_decrypt(payload).decode("utf-8")
+        decoded = json.loads(plain)
+    else:
+        decoded = value
+    if not isinstance(decoded, dict):
+        raise ValueError("数据文件格式无效")
+    return decoded
+
+
+def read_data_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return decode_data_object(raw)
+
+
+def write_data_file(path, data, encrypted=True):
+    payload = make_encrypted_data_envelope(data) if encrypted else data
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
 class StickyNote:
     def __init__(self, root):
         self.root = root
@@ -331,6 +495,7 @@ class StickyNote:
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", False)
         self.root.attributes("-alpha", 0.95)
+        self.data_loaded_from_plaintext = False
 
         self.data = self.load_data()
         self.current_color = self.data.get("color", "yellow")
@@ -389,6 +554,8 @@ class StickyNote:
         # 写入 pid 文件，供 bat 脚本判断是否已启动
         self._write_pid()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.data_loaded_from_plaintext:
+            self.save_data()
 
     def get_theme(self):
         """获取当前主题的颜色配置"""
@@ -558,11 +725,11 @@ class StickyNote:
         self.toolbar.pack(fill=tk.X, side=tk.BOTTOM)
 
         # 工具栏按钮：带悬停圆角效果
-        def _hover_btn(parent, text, cmd, padx=6):
+        def _hover_btn(parent, text, cmd, padx=2, side=tk.LEFT, inner_padx=4):
             btn = tk.Label(parent, text=text, bg=theme["bg"], fg=theme["fg"],
                            font=("Microsoft YaHei", 9), cursor="hand2",
-                           padx=6, pady=1)
-            btn.pack(side=tk.LEFT, padx=padx)
+                           padx=inner_padx, pady=1)
+            btn.pack(side=side, padx=padx)
             btn.bind("<Button-1>", cmd)
             # 悬停用固定浅灰，避免主题切换后颜色不匹配
             btn.bind("<Enter>", lambda e, b=btn, obg=theme["bg"]: b.config(bg="#E0E0E0"))
@@ -574,10 +741,12 @@ class StickyNote:
         self.color_btn = _hover_btn(self.toolbar, "颜色", self.cycle_color)
         self.clock_btn = _hover_btn(self.toolbar, "时钟", lambda e: self.toggle_clock())
         self.remind_btn = _hover_btn(self.toolbar, "+提醒", self.set_reminder)
-        self.remind_count = _hover_btn(self.toolbar, f"提醒({len(self.reminders)})", lambda e: self.show_reminders(), padx=4)
+        self.remind_count = _hover_btn(self.toolbar, f"提醒({len(self.reminders)})", lambda e: self.show_reminders())
+        self.schedule_btn = _hover_btn(self.toolbar, "日程", lambda e: self.show_schedules())
+        self.data_btn = _hover_btn(self.toolbar, "数据", self.show_data_menu, side=tk.RIGHT)
 
         self.time_label = tk.Label(self.toolbar, text="", bg=theme["bg"], fg=theme["fg"], font=("Microsoft YaHei", 9))
-        self.time_label.pack(side=tk.RIGHT, padx=6)
+        self.time_label.pack(side=tk.RIGHT, padx=(2, 4))
         self.update_time()
 
         # 文本编辑区（最后pack，填充剩余空间）
@@ -586,55 +755,98 @@ class StickyNote:
         self.text.insert("1.0", self.data.get("content", ""))
         self.text.bind("<KeyRelease>", lambda e: self.auto_save())
 
+    def reminder_matches_date(self, reminder, dt, lunar_year=None, lunar_month=None, lunar_day=None):
+        """判断提醒是否属于指定日期。每天提醒不进入日历标记，避免整月都是红点。"""
+        if not reminder_is_enabled(reminder):
+            return False
+        t = reminder.get("type", "once")
+        if t == "once":
+            if reminder.get("is_lunar"):
+                if lunar_month is None or lunar_day is None:
+                    return False
+                same_lunar_day = (
+                    lunar_month == safe_int(reminder.get("month")) and
+                    lunar_day == safe_int(reminder.get("day"))
+                )
+                return same_lunar_day and (
+                    lunar_year is None or
+                    safe_int(reminder.get("year"), lunar_year) == lunar_year
+                )
+            return (
+                dt.year == safe_int(reminder.get("year")) and
+                dt.month == safe_int(reminder.get("month")) and
+                dt.day == safe_int(reminder.get("day"))
+            )
+        if t == "weekly":
+            return dt.weekday() == safe_int(reminder.get("weekday"), -1)
+        if t == "monthly":
+            return dt.day == safe_int(reminder.get("day"), safe_int(reminder.get("monthly_day"), 0))
+        if t == "yearly":
+            return (
+                dt.month == safe_int(reminder.get("month"), safe_int(reminder.get("yearly_month"), 0)) and
+                dt.day == safe_int(reminder.get("day"), safe_int(reminder.get("yearly_day"), 0))
+            )
+        if t == "lunar_yearly":
+            return (
+                lunar_month == safe_int(reminder.get("lunar_month")) and
+                lunar_day == safe_int(reminder.get("lunar_day"))
+            )
+        if t == "lunar_monthly":
+            return lunar_day == safe_int(reminder.get("lunar_day"))
+        return False
+
     def get_important_reminders_for_date(self, dt, lunar_year=None, lunar_month=None, lunar_day=None):
-        """返回某天对应的日期型提醒；每天/每周提醒不参与红点。"""
+        """返回某天对应的日期型提醒；每周提醒按星期参与红点，每天提醒不参与。"""
         matched = []
         for reminder in self.reminders:
             try:
-                t = reminder.get("type", "once")
-                if t == "once":
-                    if reminder.get("is_lunar"):
-                        if lunar_month is None or lunar_day is None:
-                            continue
-                        same_lunar_day = (
-                            lunar_month == int(reminder.get("month", 0)) and
-                            lunar_day == int(reminder.get("day", 0))
-                        )
-                        if same_lunar_day and (
-                            lunar_year is None or
-                            int(reminder.get("year", lunar_year)) == lunar_year
-                        ):
-                            matched.append(reminder)
-                    elif (
-                        dt.year == int(reminder.get("year", 0)) and
-                        dt.month == int(reminder.get("month", 0)) and
-                        dt.day == int(reminder.get("day", 0))
-                    ):
-                        matched.append(reminder)
-                elif t == "monthly":
-                    if dt.day == int(reminder.get("day", 0)):
-                        matched.append(reminder)
-                elif t == "yearly":
-                    if (
-                        dt.month == int(reminder.get("month", 0)) and
-                        dt.day == int(reminder.get("day", 0))
-                    ):
-                        matched.append(reminder)
-                elif t == "lunar_yearly":
-                    if (
-                        lunar_month == int(reminder.get("lunar_month", 0)) and
-                        lunar_day == int(reminder.get("lunar_day", 0))
-                    ):
-                        matched.append(reminder)
-                elif t == "lunar_monthly":
-                    if lunar_day == int(reminder.get("lunar_day", 0)):
-                        matched.append(reminder)
+                if self.reminder_matches_date(reminder, dt, lunar_year, lunar_month, lunar_day):
+                    matched.append(reminder)
             except Exception:
                 continue
         return matched
 
     def has_important_reminder(self, dt, lunar_year=None, lunar_month=None, lunar_day=None):
         return bool(self.get_important_reminders_for_date(dt, lunar_year, lunar_month, lunar_day))
+
+    def next_reminder_notification_time(self, reminder, from_time=None):
+        if not reminder_is_enabled(reminder):
+            return datetime.max
+        from_time = from_time or datetime.now()
+        hour = safe_int(reminder.get("hour"), 0)
+        minute = safe_int(reminder.get("minute"), 0)
+        advance_minutes = get_advance_minutes(reminder)
+        reminder_type = reminder.get("type", "once")
+        search_days = 370
+        if reminder_type in {"lunar_yearly", "lunar_monthly"}:
+            search_days = 430
+
+        for day_offset in range(0, search_days + 1):
+            candidate_date = from_time.date() + timedelta(days=day_offset)
+            candidate_dt = datetime(candidate_date.year, candidate_date.month, candidate_date.day)
+
+            if reminder_type == "daily":
+                matches_date = True
+            else:
+                lunar_year, lunar_month, lunar_day = self.get_lunar_parts_for_date(candidate_dt)
+                matches_date = self.reminder_matches_date(
+                    reminder,
+                    candidate_dt,
+                    lunar_year,
+                    lunar_month,
+                    lunar_day,
+                )
+            if not matches_date:
+                continue
+
+            try:
+                scheduled_time = candidate_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            except ValueError:
+                continue
+            notification_time = scheduled_time - timedelta(minutes=advance_minutes)
+            if notification_time >= from_time:
+                return notification_time
+        return datetime.max
 
     def build_calendar(self):
         theme = self.get_theme()
@@ -666,6 +878,8 @@ class StickyNote:
                                    font=("Microsoft YaHei", 11, "bold"))
         self.cal_title.pack(side=tk.LEFT, expand=True)
 
+        _nav_btn(nav, "今天", self.go_to_today)
+        _nav_btn(nav, "跳转", self.jump_to_month)
         _nav_btn(nav, "▶", lambda e: self.change_month(1))
 
         # 星期标题 - 带分隔线
@@ -863,6 +1077,105 @@ class StickyNote:
             self.cal_year -= 1
         self.build_calendar()
 
+    def go_to_today(self, event=None):
+        now = datetime.now()
+        self.cal_year = now.year
+        self.cal_month = now.month
+        self.build_calendar()
+
+    def jump_to_month(self, event=None):
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        dialog = tk.Toplevel(self.root)
+        dialog.title("跳转年月")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        x = self.root.winfo_x() + 35
+        y = self.root.winfo_y() + 80
+        dialog.geometry(f"300x190+{x}+{y}")
+        dialog_bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        text_fg = "#263238"
+        muted_fg = "#607D8B"
+        dialog.config(bg=dialog_bg)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="跳转年月",
+            bg=accent,
+            fg="#FFFFFF",
+            font=("Microsoft YaHei", 13, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(12, 1))
+        tk.Label(
+            header,
+            text="选择要查看的日历月份",
+            bg=accent,
+            fg="#F5F7FA",
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        body = tk.Frame(dialog, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+        row = tk.Frame(body, bg=panel_bg)
+        row.pack(fill=tk.X, padx=14, pady=(18, 12))
+        tk.Label(row, text="年月", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold")).pack(side=tk.LEFT, padx=(0, 12))
+
+        now = datetime.now()
+        year_values = [str(y) for y in range(now.year - 20, now.year + 21)]
+        year_var = tk.StringVar(value=str(self.cal_year))
+        year_combo = ttk.Combobox(row, textvariable=year_var, values=year_values,
+                                  width=7, state="readonly", font=("Microsoft YaHei", 10))
+        year_combo.pack(side=tk.LEFT, padx=(0, 4))
+        tk.Label(row, text="年", bg=panel_bg, fg=text_fg, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
+
+        month_var = tk.StringVar(value=str(self.cal_month))
+        month_combo = ttk.Combobox(row, textvariable=month_var,
+                                   values=[str(m) for m in range(1, 13)],
+                                   width=5, state="readonly", font=("Microsoft YaHei", 10))
+        month_combo.pack(side=tk.LEFT, padx=(10, 4))
+        tk.Label(row, text="月", bg=panel_bg, fg=text_fg, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
+
+        def apply_jump():
+            year = safe_int(year_var.get(), self.cal_year)
+            month = safe_int(month_var.get(), self.cal_month)
+            if year < 1900 or not 1 <= month <= 12:
+                messagebox.showwarning("日期无效", "请选择有效的年份和月份。", parent=dialog)
+                return
+            self.cal_year = year
+            self.cal_month = month
+            self.build_calendar()
+            dialog.destroy()
+
+        button_bar = tk.Frame(body, bg=panel_bg)
+        button_bar.pack(fill=tk.X, padx=14, pady=(4, 12))
+
+        def make_button(parent, text, bg, fg, command, hover_bg):
+            btn = tk.Label(parent, text=text, bg=bg, fg=fg,
+                           font=("Microsoft YaHei", 10, "bold"),
+                           padx=18, pady=6, cursor="hand2")
+            btn.bind("<Button-1>", lambda e: command())
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover_bg))
+            btn.bind("<Leave>", lambda e, b=btn, normal=bg: b.config(bg=normal))
+            return btn
+
+        cancel_btn = make_button(button_bar, "取消", "#ECEFF1", "#455A64",
+                                 dialog.destroy, "#DDE3EA")
+        cancel_btn.pack(side=tk.LEFT)
+        jump_btn = make_button(button_bar, "跳转", accent, "#FFFFFF",
+                               apply_jump, "#0D47A1")
+        jump_btn.pack(side=tk.RIGHT)
+        dialog.bind("<Return>", lambda e: apply_jump())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
     def get_lunar_parts_for_date(self, dt):
         if CNLUNAR_OK:
             try:
@@ -882,6 +1195,13 @@ class StickyNote:
         t = reminder.get("type", "once")
         if t == "once":
             return "农历单次" if reminder.get("is_lunar") else "单次"
+        if t == "daily":
+            return "每天"
+        if t == "weekly":
+            weekday = safe_int(reminder.get("weekday"), -1)
+            if 0 <= weekday < len(WEEKDAYS):
+                return f"每周{WEEKDAYS[weekday]}"
+            return "每周"
         if t == "monthly":
             return "每月"
         if t == "yearly":
@@ -940,7 +1260,8 @@ class StickyNote:
             hour = int(reminder.get("hour", 0))
             minute = int(reminder.get("minute", 0))
             kind = self.format_date_reminder_type(reminder)
-            tk.Label(body, text=f"{kind}  {hour:02d}:{minute:02d}",
+            time_text = format_reminder_time(hour, minute, get_advance_minutes(reminder))
+            tk.Label(body, text=f"{kind}  {time_text}",
                      bg=panel, fg=muted, font=("Microsoft YaHei", 9, "bold"),
                      anchor="w").pack(fill=tk.X)
             tk.Label(body, text=reminder.get("message", ""),
@@ -963,11 +1284,22 @@ class StickyNote:
         menu.add_command(label="添加日程", command=lambda: self.add_schedule(year, month, day))
 
         date_key = f"{year:04d}-{month:02d}-{day:02d}"
-        if date_key in self.schedules and self.schedules[date_key]:
+        schedule_items = self.schedules.get(date_key, [])
+        if isinstance(schedule_items, list) and schedule_items:
             menu.add_separator()
             menu.add_command(label="已有日程:", state="disabled")
-            for item in self.schedules[date_key]:
-                menu.add_command(label=f"  · {item}", state="disabled")
+            for idx, item in enumerate(schedule_items):
+                item_text = self.schedule_menu_text(item, idx)
+                item_menu = tk.Menu(menu, tearoff=0)
+                item_menu.add_command(
+                    label="编辑",
+                    command=lambda i=idx: self.add_schedule(year, month, day, edit_index=i),
+                )
+                item_menu.add_command(
+                    label="删除",
+                    command=lambda i=idx: self.delete_schedule(year, month, day, i),
+                )
+                menu.add_cascade(label=item_text, menu=item_menu)
 
         menu.tk_popup(event.x_root, event.y_root)
 
@@ -988,7 +1320,8 @@ class StickyNote:
             widget.config(bg=theme["bg"])
         for widget in [self.title_label, self.close_btn, self.min_btn, self.cal_btn, self.theme_btn,
                        self.clock_btn,
-                       self.color_btn, self.remind_btn, self.remind_count, self.time_label]:
+                       self.color_btn, self.remind_btn, self.remind_count, self.schedule_btn,
+                       self.data_btn, self.time_label]:
             widget.config(bg=theme["bg"], fg=theme["fg"])
         self.date_text_label.config(bg=theme["bg"], fg=theme.get("today", theme["fg"]))
         self.weather_icon_label.config(bg=theme["bg"], fg=weather_icon_color(self.weather_icon, theme))
@@ -1608,19 +1941,150 @@ class StickyNote:
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                    raw = json.load(f)
+                self.data_loaded_from_plaintext = not is_encrypted_data_envelope(raw)
+                return decode_data_object(raw)
+            except Exception as e:
+                print(f"[读取失败] {e}")
         return {}
 
     def save_data(self):
         try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
+            write_data_file(DATA_FILE, self.data, encrypted=True)
             return True
         except Exception as e:
             print(f"[保存失败] {e}")
             return False
+
+    def show_data_menu(self, event=None):
+        menu = tk.Menu(self.root, tearoff=0, font=("Microsoft YaHei", 10))
+        menu.add_command(label="导出加密备份...", command=self.export_encrypted_backup)
+        menu.add_command(label="导出明文 JSON...", command=self.export_plain_backup)
+        menu.add_separator()
+        menu.add_command(label="导入数据...", command=self.import_data_backup)
+        if event is not None:
+            menu.tk_popup(event.x_root, event.y_root)
+        else:
+            menu.tk_popup(self.root.winfo_x() + 80, self.root.winfo_y() + self.root.winfo_height() - 30)
+
+    def export_encrypted_backup(self):
+        self.auto_save()
+        default_name = f"雨然日历备份-{datetime.now().strftime('%Y%m%d-%H%M')}.yuran"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出加密备份",
+            initialfile=default_name,
+            defaultextension=".yuran",
+            filetypes=[("雨然日历加密备份", "*.yuran"), ("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            write_data_file(path, self.data, encrypted=True)
+            messagebox.showinfo(
+                "导出成功",
+                "加密备份已导出。\n\n注意：该备份使用 Windows 当前用户加密，通常只能在当前 Windows 用户下导入。",
+                parent=self.root,
+            )
+        except Exception as e:
+            messagebox.showerror("导出失败", f"加密备份导出失败：\n{e}", parent=self.root)
+
+    def export_plain_backup(self):
+        if not messagebox.askyesno(
+            "导出明文 JSON",
+            "明文 JSON 会直接包含便签、提醒、日程等内容。\n\n确定要导出吗？",
+            parent=self.root,
+        ):
+            return
+        self.auto_save()
+        default_name = f"雨然日历明文备份-{datetime.now().strftime('%Y%m%d-%H%M')}.json"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="导出明文 JSON",
+            initialfile=default_name,
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            write_data_file(path, self.data, encrypted=False)
+            messagebox.showinfo("导出成功", "明文 JSON 已导出。请妥善保管该文件。", parent=self.root)
+        except Exception as e:
+            messagebox.showerror("导出失败", f"明文 JSON 导出失败：\n{e}", parent=self.root)
+
+    def import_data_backup(self):
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="导入数据",
+            filetypes=[
+                ("雨然日历备份/JSON", "*.yuran *.json"),
+                ("雨然日历加密备份", "*.yuran"),
+                ("JSON 文件", "*.json"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            imported = read_data_file(path)
+        except Exception as e:
+            messagebox.showerror(
+                "导入失败",
+                f"无法读取该数据文件：\n{e}\n\n如果这是加密备份，请确认它来自当前 Windows 用户。",
+                parent=self.root,
+            )
+            return
+        if not messagebox.askyesno(
+            "导入数据",
+            "导入会覆盖当前便签、提醒、日程、主题和天气设置。\n\n确定继续吗？",
+            parent=self.root,
+        ):
+            return
+        self.apply_loaded_data(imported)
+        if self.save_data():
+            messagebox.showinfo("导入成功", "数据已导入并加密保存。", parent=self.root)
+        else:
+            messagebox.showwarning("导入完成", "数据已导入，但写入本地加密文件失败。", parent=self.root)
+
+    def apply_loaded_data(self, data):
+        self.data = data
+        self.current_color = self.data.get("color", "yellow")
+        self.custom_colors = self.data.get("custom_colors", {})
+        self.reminders = self.data.get("reminders", [])
+        self.schedules = self.data.get("schedules", {})
+        self.show_calendar = self.data.get("show_calendar", True)
+        self.weather_info = self.data.get("weather", {})
+        if not isinstance(self.weather_info, dict):
+            self.weather_info = {}
+        self.weather_location = self.weather_info.get("location")
+        self.weather_text = self.weather_info.get("display", "天气加载中")
+        self.weather_icon = self.weather_info.get("icon", WEATHER_ICON_DEFAULT)
+        self.show_clock = self.data.get("show_clock", True)
+        self.clock_style = self.data.get("clock_style", "analog")
+        if self.clock_style not in ("analog", "digital"):
+            self.clock_style = "analog"
+        self.all_colors = dict(DEFAULT_COLORS)
+        self.all_colors.update(self.custom_colors)
+
+        self.text.delete("1.0", tk.END)
+        self.text.insert("1.0", self.data.get("content", ""))
+        self.remind_count.config(text=f"提醒({len(self.reminders)})")
+
+        target_h = 582 if self.show_calendar else 402
+        if self.show_calendar:
+            if not self.calendar_frame.winfo_ismapped():
+                self.calendar_frame.pack(fill=tk.X, side=tk.TOP, padx=4, pady=2, before=self.toolbar)
+        else:
+            self.calendar_frame.pack_forget()
+        self.root.geometry(f"380x{target_h}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+
+        if self.show_clock:
+            self.show_floating_clock(self.clock_style)
+        else:
+            self.hide_floating_clock()
+        self.apply_color()
+        self.update_date_info()
 
     def show_reminders(self):
         """打开提醒列表对话框"""
@@ -1651,54 +2115,129 @@ class StickyNote:
         canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=340)
         canvas.configure(yscrollcommand=scrollbar.set)
 
+        def _scroll_canvas_units(units):
+            if canvas.winfo_exists():
+                canvas.yview_scroll(units, "units")
+
+        def _on_mousewheel(event):
+            if event.delta:
+                units = -int(event.delta / 120)
+                if units == 0:
+                    units = -1 if event.delta > 0 else 1
+                _scroll_canvas_units(units)
+            return "break"
+
+        def _on_scroll_up(event):
+            _scroll_canvas_units(-1)
+            return "break"
+
+        def _on_scroll_down(event):
+            _scroll_canvas_units(1)
+            return "break"
+
+        dialog.bind_all("<MouseWheel>", _on_mousewheel)
+        dialog.bind_all("<Button-4>", _on_scroll_up)
+        dialog.bind_all("<Button-5>", _on_scroll_down)
+
+        def _unbind_mousewheel(event=None):
+            dialog.unbind_all("<MouseWheel>")
+            dialog.unbind_all("<Button-4>")
+            dialog.unbind_all("<Button-5>")
+
+        dialog.bind("<Destroy>", _unbind_mousewheel)
+
         def format_reminder(r, idx):
             t = r.get("type", "once")
-            h = r.get("hour", 0)
-            m = r.get("minute", 0)
-            time_str = f"{h:02d}:{m:02d}"
+            h = safe_int(r.get("hour"), 0)
+            m = safe_int(r.get("minute"), 0)
+            time_str = format_reminder_time(h, m, get_advance_minutes(r))
             msg = r.get("message", "")
+            status = "（已停用）" if not reminder_is_enabled(r) else ""
 
             if t == "once":
                 if r.get("is_lunar"):
                     date_str = f"农历 {r['year']}年{r['month']}月{r['day']}日"
+                elif r.get("snooze"):
+                    date_str = f"稍后 {r['year']}年{r['month']}月{r['day']}日"
                 else:
                     date_str = f"{r['year']}年{r['month']}月{r['day']}日"
-                return f"[{idx+1}] 单次 · {date_str} {time_str}\n    {msg}"
+                return f"[{idx+1}] 单次{status} · {date_str} {time_str}\n    {msg}"
             elif t == "daily":
-                return f"[{idx+1}] 每天 · {time_str}\n    {msg}"
+                return f"[{idx+1}] 每天{status} · {time_str}\n    {msg}"
             elif t == "weekly":
-                wd = WEEKDAYS[r.get("weekday", 0)]
-                return f"[{idx+1}] 每周{wd} · {time_str}\n    {msg}"
+                weekday = safe_int(r.get("weekday"), 0)
+                wd = WEEKDAYS[weekday] if 0 <= weekday < len(WEEKDAYS) else "周一"
+                return f"[{idx+1}] 每周{wd}{status} · {time_str}\n    {msg}"
             elif t == "monthly":
-                d = r.get("day", 1)
-                return f"[{idx+1}] 每月{d}号 · {time_str}\n    {msg}"
+                d = safe_int(r.get("day"), safe_int(r.get("monthly_day"), 1))
+                return f"[{idx+1}] 每月{d}号{status} · {time_str}\n    {msg}"
             elif t == "yearly":
-                mo = r.get("month", 1)
-                d = r.get("day", 1)
-                return f"[{idx+1}] 每年{mo}月{d}日 · {time_str}\n    {msg}"
+                mo = safe_int(r.get("month"), safe_int(r.get("yearly_month"), 1))
+                d = safe_int(r.get("day"), safe_int(r.get("yearly_day"), 1))
+                return f"[{idx+1}] 每年{mo}月{d}日{status} · {time_str}\n    {msg}"
             elif t == "lunar_yearly":
-                lm = r.get("lunar_month", 1)
-                ld = r.get("lunar_day", 1)
-                return f"[{idx+1}] 每年农历{lm}月{ld}日 · {time_str}\n    {msg}"
+                lm = safe_int(r.get("lunar_month"), 1)
+                ld = safe_int(r.get("lunar_day"), 1)
+                return f"[{idx+1}] 每年农历{lm}月{ld}日{status} · {time_str}\n    {msg}"
             elif t == "lunar_monthly":
-                ld = r.get("lunar_day", 1)
-                return f"[{idx+1}] 每月农历{ld}日 · {time_str}\n    {msg}"
-            return f"[{idx+1}] {time_str}\n    {msg}"
+                ld = safe_int(r.get("lunar_day"), 1)
+                return f"[{idx+1}] 每月农历{ld}日{status} · {time_str}\n    {msg}"
+            return f"[{idx+1}] {time_str}{status}\n    {msg}"
 
         if not self.reminders:
             tk.Label(scroll_frame, text="暂无提醒", fg="gray", font=("Microsoft YaHei", 10)).pack(pady=20)
         else:
-            for i, r in enumerate(self.reminders):
+            now_for_sort = datetime.now()
+            sorted_reminders = sorted(
+                enumerate(self.reminders),
+                key=lambda item: (
+                    0 if reminder_is_enabled(item[1]) else 1,
+                    self.next_reminder_notification_time(item[1], now_for_sort),
+                    item[0],
+                ),
+            )
+            for display_idx, (i, r) in enumerate(sorted_reminders):
                 row = tk.Frame(scroll_frame)
                 row.pack(fill=tk.X, padx=10, pady=4)
 
-                text = format_reminder(r, i)
-                lbl = tk.Label(row, text=text, font=("Microsoft YaHei", 9), anchor="w", justify=tk.LEFT,
-                               wraplength=260)
+                text = format_reminder(r, display_idx)
+                text_color = "#777777" if not reminder_is_enabled(r) else "#212121"
+                lbl = tk.Label(row, text=text, fg=text_color, font=("Microsoft YaHei", 9),
+                               anchor="w", justify=tk.LEFT, wraplength=240)
                 lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-                del_btn = tk.Label(row, text="删除", fg="#D32F2F", font=("Microsoft YaHei", 9), cursor="hand2")
-                del_btn.pack(side=tk.RIGHT, padx=(4, 0))
+                actions = tk.Frame(row)
+                actions.pack(side=tk.RIGHT, padx=(4, 0))
+
+                edit_btn = tk.Label(actions, text="编辑", fg="#1976D2",
+                                    font=("Microsoft YaHei", 9), cursor="hand2")
+                edit_btn.pack(anchor="e")
+
+                toggle_text = "停用" if reminder_is_enabled(r) else "启用"
+                toggle_color = "#757575" if reminder_is_enabled(r) else "#2E7D32"
+                toggle_btn = tk.Label(actions, text=toggle_text, fg=toggle_color,
+                                      font=("Microsoft YaHei", 9), cursor="hand2")
+                toggle_btn.pack(anchor="e", pady=(4, 0))
+
+                del_btn = tk.Label(actions, text="删除", fg="#D32F2F",
+                                   font=("Microsoft YaHei", 9), cursor="hand2")
+                del_btn.pack(anchor="e", pady=(4, 0))
+
+                def do_edit(idx=i):
+                    dialog.destroy()
+                    self.set_reminder(edit_index=idx)
+
+                edit_btn.bind("<Button-1>", lambda e, f=do_edit: f())
+
+                def do_toggle(idx=i):
+                    if 0 <= idx < len(self.reminders):
+                        self.reminders[idx]["enabled"] = not reminder_is_enabled(self.reminders[idx])
+                        self.auto_save()
+                        self.build_calendar()
+                    dialog.destroy()
+                    self.show_reminders()
+
+                toggle_btn.bind("<Button-1>", lambda e, f=do_toggle: f())
 
                 def do_delete(idx=i):
                     self.reminders.pop(idx)
@@ -1713,83 +2252,595 @@ class StickyNote:
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-    def add_schedule(self, year, month, day):
-        """为指定日期添加日程安排"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("添加日程")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.attributes("-topmost", True)
+    def schedule_entry_datetime(self, date_key, item):
+        hour, minute, content = self.parse_schedule_item(item)
+        try:
+            base = datetime.strptime(date_key, "%Y-%m-%d")
+            return base.replace(hour=hour, minute=minute, second=0, microsecond=0), content
+        except ValueError:
+            return datetime.max, content
 
-        x = self.root.winfo_x() + 20
-        y = self.root.winfo_y() + 60
-        dialog.geometry(f"300x200+{x}+{y}")
-        dialog.resizable(False, False)
+    def sorted_schedule_entries(self):
+        entries = []
+        for date_key, items in self.schedules.items():
+            if not isinstance(items, list):
+                continue
+            for index, item in enumerate(items):
+                schedule_dt, content = self.schedule_entry_datetime(date_key, item)
+                entries.append({
+                    "date_key": date_key,
+                    "index": index,
+                    "item": item,
+                    "datetime": schedule_dt,
+                    "content": content,
+                })
 
-        tk.Label(dialog, text=f"{year}年{month}月{day}日", font=("Microsoft YaHei", 11, "bold")).pack(pady=(10, 5))
-
-        # 时间选择器（下拉列表）
-        tk.Label(dialog, text="时间（可选）:", font=("Microsoft YaHei", 10)).pack()
-        time_frame = tk.Frame(dialog)
-        time_frame.pack(pady=2)
         now = datetime.now()
-        hour_var = tk.StringVar(value=f"{now.hour:02d}")
-        hour_combo = ttk.Combobox(time_frame, textvariable=hour_var,
-                                  values=[f"{h:02d}" for h in range(0, 24)],
-                                  width=4, state="readonly", font=("Microsoft YaHei", 10))
-        hour_combo.pack(side=tk.LEFT, padx=2)
-        tk.Label(time_frame, text=":", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, padx=2)
-        minute_var = tk.StringVar(value=f"{now.minute:02d}")
-        minute_combo = ttk.Combobox(time_frame, textvariable=minute_var,
-                                    values=[f"{m:02d}" for m in range(0, 60)],
-                                    width=4, state="readonly", font=("Microsoft YaHei", 10))
-        minute_combo.pack(side=tk.LEFT, padx=2)
+        upcoming = [entry for entry in entries if entry["datetime"] >= now]
+        passed = [entry for entry in entries if entry["datetime"] < now]
+        upcoming.sort(key=lambda entry: (entry["datetime"], entry["date_key"], entry["index"]))
+        passed.sort(key=lambda entry: (entry["datetime"], entry["date_key"], entry["index"]), reverse=True)
+        return upcoming + passed
 
-        tk.Label(dialog, text="日程内容:", font=("Microsoft YaHei", 10)).pack(pady=(8, 2))
-        content_entry = tk.Entry(dialog, font=("Microsoft YaHei", 11), width=28)
-        content_entry.pack(pady=2)
-        content_entry.focus()
-
-        def save():
-            content = content_entry.get().strip()
-            if not content:
-                messagebox.showwarning("内容为空", "请输入日程内容")
-                return
-
-            hour = hour_var.get()
-            minute = minute_var.get()
-            if hour and minute:
-                item = f"{hour}:{minute} {content}"
-            else:
-                item = content
-
-            date_key = f"{year:04d}-{month:02d}-{day:02d}"
-            if date_key not in self.schedules:
-                self.schedules[date_key] = []
-            self.schedules[date_key].append(item)
-            if not self.auto_save():
-                messagebox.showwarning("保存失败", "日程已添加，但写入文件失败，重启后可能丢失。")
-            self.build_calendar()
-            dialog.destroy()
-
-        tk.Button(dialog, text="确定", command=save, font=("Microsoft YaHei", 10), width=10).pack(pady=10)
-
-    def set_reminder(self, event=None, prefill=None):
+    def show_schedules(self, event=None):
+        """打开日程列表对话框"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("设置提醒")
+        dialog.title("日程列表")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.attributes("-topmost", True)
 
         x = self.root.winfo_x() + 10
         y = self.root.winfo_y() + 40
-        dialog.geometry(f"280x300+{x}+{y}")
+        dialog.geometry(f"380x460+{x}+{y}")
         dialog.resizable(False, False)
+
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        muted_fg = "#607D8B"
+        text_fg = "#263238"
+        dialog.config(bg=bg)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        entries = self.sorted_schedule_entries()
+        tk.Label(
+            header,
+            text=f"日程列表（{len(entries)}）",
+            bg=accent,
+            fg="#FFFFFF",
+            font=("Microsoft YaHei", 14, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(12, 1))
+        tk.Label(
+            header,
+            text="未来日程优先，已过日程排在后面",
+            bg=accent,
+            fg="#F5F7FA",
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=16, pady=(0, 10))
+
+        list_container = tk.Frame(dialog, bg=bg)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(10, 6))
+        canvas = tk.Canvas(list_container, width=352, height=300, bg=bg, highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        scroll_frame = tk.Frame(canvas, bg=bg)
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw", width=352)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _scroll_canvas_units(units):
+            if canvas.winfo_exists():
+                canvas.yview_scroll(units, "units")
+
+        def _on_mousewheel(event):
+            if event.delta:
+                units = -int(event.delta / 120)
+                if units == 0:
+                    units = -1 if event.delta > 0 else 1
+                _scroll_canvas_units(units)
+            return "break"
+
+        def _on_scroll_up(event):
+            _scroll_canvas_units(-1)
+            return "break"
+
+        def _on_scroll_down(event):
+            _scroll_canvas_units(1)
+            return "break"
+
+        dialog.bind_all("<MouseWheel>", _on_mousewheel)
+        dialog.bind_all("<Button-4>", _on_scroll_up)
+        dialog.bind_all("<Button-5>", _on_scroll_down)
+
+        def _unbind_mousewheel(event=None):
+            dialog.unbind_all("<MouseWheel>")
+            dialog.unbind_all("<Button-4>")
+            dialog.unbind_all("<Button-5>")
+
+        dialog.bind("<Destroy>", _unbind_mousewheel)
+
+        def open_new_today():
+            now = datetime.now()
+            dialog.destroy()
+            self.add_schedule(now.year, now.month, now.day, return_to_list=True)
+
+        if not entries:
+            empty = tk.Frame(scroll_frame, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+            empty.pack(fill=tk.X, padx=12, pady=14)
+            tk.Label(empty, text="暂无日程", bg=panel_bg, fg=muted_fg,
+                     font=("Microsoft YaHei", 11, "bold")).pack(pady=(18, 4))
+            add_btn = tk.Label(empty, text="添加今日日程", bg=accent, fg="#FFFFFF",
+                               font=("Microsoft YaHei", 10, "bold"),
+                               padx=16, pady=6, cursor="hand2")
+            add_btn.pack(pady=(4, 18))
+            add_btn.bind("<Button-1>", lambda e: open_new_today())
+        else:
+            now = datetime.now()
+            for entry in entries:
+                schedule_dt = entry["datetime"]
+                is_passed = schedule_dt < now
+                row = tk.Frame(scroll_frame, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+                row.pack(fill=tk.X, padx=12, pady=5)
+
+                bar_color = "#9E9E9E" if is_passed else accent
+                bar = tk.Frame(row, bg=bar_color, width=4)
+                bar.pack(side=tk.LEFT, fill=tk.Y)
+
+                body = tk.Frame(row, bg=panel_bg)
+                body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=9, pady=8)
+
+                weekday = WEEKDAYS[schedule_dt.weekday()] if schedule_dt != datetime.max else ""
+                status = "  已过" if is_passed else ""
+                time_text = schedule_dt.strftime("%Y-%m-%d %H:%M") if schedule_dt != datetime.max else entry["date_key"]
+                tk.Label(body, text=f"{time_text} {weekday}{status}",
+                         bg=panel_bg, fg=muted_fg, font=("Microsoft YaHei", 9, "bold"),
+                         anchor="w").pack(fill=tk.X)
+                tk.Label(body, text=entry["content"] or "未命名日程",
+                         bg=panel_bg, fg=text_fg, font=("Microsoft YaHei", 10),
+                         anchor="w", justify=tk.LEFT, wraplength=235).pack(fill=tk.X, pady=(3, 0))
+
+                actions = tk.Frame(row, bg=panel_bg)
+                actions.pack(side=tk.RIGHT, padx=(0, 8), pady=8)
+
+                edit_btn = tk.Label(actions, text="编辑", bg=panel_bg, fg="#1976D2",
+                                    font=("Microsoft YaHei", 9), cursor="hand2")
+                edit_btn.pack(anchor="e")
+                delete_btn = tk.Label(actions, text="删除", bg=panel_bg, fg="#D32F2F",
+                                      font=("Microsoft YaHei", 9), cursor="hand2")
+                delete_btn.pack(anchor="e", pady=(6, 0))
+
+                def do_edit(date_key=entry["date_key"], index=entry["index"]):
+                    try:
+                        year, month, day = [int(part) for part in date_key.split("-")]
+                    except ValueError:
+                        messagebox.showwarning("编辑失败", "日程日期格式无效。", parent=dialog)
+                        return
+                    dialog.destroy()
+                    self.add_schedule(year, month, day, edit_index=index, return_to_list=True)
+
+                def do_delete(date_key=entry["date_key"], index=entry["index"]):
+                    try:
+                        year, month, day = [int(part) for part in date_key.split("-")]
+                    except ValueError:
+                        messagebox.showwarning("删除失败", "日程日期格式无效。", parent=dialog)
+                        return
+                    if self.delete_schedule(year, month, day, index, parent=dialog):
+                        dialog.destroy()
+                        self.show_schedules()
+
+                edit_btn.bind("<Button-1>", lambda e, f=do_edit: f())
+                delete_btn.bind("<Button-1>", lambda e, f=do_delete: f())
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        footer = tk.Frame(dialog, bg=bg)
+        footer.pack(fill=tk.X, padx=14, pady=(0, 12))
+        add_btn = tk.Label(footer, text="添加今日日程", bg=accent, fg="#FFFFFF",
+                           font=("Microsoft YaHei", 10, "bold"),
+                           padx=16, pady=6, cursor="hand2")
+        add_btn.pack(side=tk.LEFT)
+        close_btn = tk.Label(footer, text="关闭", bg="#ECEFF1", fg="#455A64",
+                             font=("Microsoft YaHei", 10, "bold"),
+                             padx=16, pady=6, cursor="hand2")
+        close_btn.pack(side=tk.RIGHT)
+        add_btn.bind("<Button-1>", lambda e: open_new_today())
+        close_btn.bind("<Button-1>", lambda e: dialog.destroy())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+    def schedule_menu_text(self, item, index):
+        text = str(item).strip() or "未命名日程"
+        if len(text) > 26:
+            text = text[:25] + "..."
+        return f"{index + 1}. {text}"
+
+    def parse_schedule_item(self, item):
+        text = str(item).strip()
+        if (
+            len(text) >= 5
+            and text[0:2].isdigit()
+            and text[2] == ":"
+            and text[3:5].isdigit()
+        ):
+            hour = safe_int(text[0:2], -1)
+            minute = safe_int(text[3:5], -1)
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                content = text[5:].strip()
+                return hour, minute, content
+        now = datetime.now()
+        return now.hour, now.minute, text
+
+    def schedule_item_from_reminder(self, reminder):
+        reminder_for_schedule = dict(reminder)
+        reminder_for_schedule["enabled"] = True
+        notification_time = self.next_reminder_notification_time(reminder_for_schedule, datetime.now())
+        if notification_time == datetime.max:
+            return None, None
+        scheduled_time = notification_time + timedelta(minutes=get_advance_minutes(reminder_for_schedule))
+        item = f"{scheduled_time.hour:02d}:{scheduled_time.minute:02d} {reminder_for_schedule.get('message', '').strip()}"
+        return scheduled_time.strftime("%Y-%m-%d"), item
+
+    def add_schedule_from_reminder(self, reminder):
+        date_key, item = self.schedule_item_from_reminder(reminder)
+        if not date_key or not item:
+            return None, None
+        if date_key not in self.schedules or not isinstance(self.schedules.get(date_key), list):
+            self.schedules[date_key] = []
+        if item not in self.schedules[date_key]:
+            self.schedules[date_key].append(item)
+        return date_key, item
+
+    def delete_schedule(self, year, month, day, index, parent=None):
+        parent = parent or self.root
+        date_key = f"{year:04d}-{month:02d}-{day:02d}"
+        items = self.schedules.get(date_key, [])
+        if not isinstance(items, list) or not 0 <= index < len(items):
+            messagebox.showwarning("删除失败", "这条日程已经不存在。", parent=parent)
+            return False
+
+        item = str(items[index]).strip() or "未命名日程"
+        if not messagebox.askyesno("删除日程", f"确定删除这条日程吗？\n\n{item}", parent=parent):
+            return False
+
+        items.pop(index)
+        if items:
+            self.schedules[date_key] = items
+        else:
+            self.schedules.pop(date_key, None)
+        if not self.auto_save():
+            messagebox.showwarning("保存失败", "日程已删除，但写入文件失败，重启后可能恢复。", parent=parent)
+        self.build_calendar()
+        return True
+
+    def add_schedule(self, year, month, day, edit_index=None, return_to_list=False):
+        """为指定日期添加或编辑日程安排"""
+        date_key = f"{year:04d}-{month:02d}-{day:02d}"
+        editing_item = None
+        if edit_index is not None:
+            items = self.schedules.get(date_key, [])
+            if not isinstance(items, list) or not 0 <= edit_index < len(items):
+                messagebox.showwarning("编辑失败", "这条日程已经不存在。", parent=self.root)
+                return
+            editing_item = str(items[edit_index])
+        is_editing = editing_item is not None
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑日程" if is_editing else "添加日程")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+
+        x = self.root.winfo_x() + 20
+        y = self.root.winfo_y() + 60
+        dialog.geometry(f"400x440+{x}+{y}")
+        dialog.resizable(False, False)
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        primary_hover = {
+            "#FF9800": "#F57C00",
+            "#2E7D32": "#1B5E20",
+            "#1565C0": "#0D47A1",
+            "#C2185B": "#880E4F",
+            "#6A1B9A": "#4A148C",
+            "#1976D2": "#0D47A1",
+        }.get(accent.upper(), "#0D47A1")
+        dialog_bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        field_bg = "#F8FAFC"
+        text_fg = "#263238"
+        muted_fg = "#607D8B"
+        dialog.config(bg=dialog_bg)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="编辑日程" if is_editing else "添加日程",
+            bg=accent,
+            fg="#FFFFFF",
+            font=("Microsoft YaHei", 14, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=18, pady=(14, 1))
+        tk.Label(
+            header,
+            text=f"{year}年{month}月{day}日",
+            bg=accent,
+            fg="#F5F7FA",
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=18, pady=(0, 12))
+
+        form = tk.Frame(dialog, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+        form.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        now = datetime.now()
+        initial_hour, initial_minute, initial_content = self.parse_schedule_item(editing_item or "")
+
+        time_frame = tk.Frame(form, bg=panel_bg)
+        time_frame.pack(fill=tk.X, padx=16, pady=(18, 10))
+        tk.Label(time_frame, text="日程时间", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold")).pack(side=tk.LEFT, padx=(0, 12))
+        hour_var = tk.StringVar(value=f"{initial_hour if is_editing else now.hour:02d}")
+        hour_combo = ttk.Combobox(time_frame, textvariable=hour_var,
+                                  values=[f"{h:02d}" for h in range(0, 24)],
+                                  width=4, state="readonly", font=("Microsoft YaHei", 10))
+        hour_combo.pack(side=tk.LEFT, padx=2)
+        tk.Label(time_frame, text=":", bg=panel_bg, fg=text_fg, font=("Microsoft YaHei", 10)).pack(side=tk.LEFT, padx=2)
+        minute_var = tk.StringVar(value=f"{initial_minute if is_editing else now.minute:02d}")
+        minute_combo = ttk.Combobox(time_frame, textvariable=minute_var,
+                                    values=[f"{m:02d}" for m in range(0, 60)],
+                                    width=4, state="readonly", font=("Microsoft YaHei", 10))
+        minute_combo.pack(side=tk.LEFT, padx=2)
+
+        tk.Label(form, text="日程内容", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold"), anchor="w").pack(fill=tk.X, padx=16, pady=(2, 4))
+        content_entry = tk.Text(
+            form,
+            font=("Microsoft YaHei", 11),
+            width=34,
+            height=4,
+            wrap=tk.WORD,
+            bg=field_bg,
+            fg=text_fg,
+            relief=tk.FLAT,
+            highlightbackground="#CBD5E1",
+            highlightcolor=accent,
+            highlightthickness=1,
+            padx=8,
+            pady=6,
+        )
+        content_entry.pack(fill=tk.X, padx=16, pady=(0, 10))
+        if is_editing:
+            content_entry.insert("1.0", initial_content)
+
+        remind_frame = tk.Frame(form, bg=panel_bg)
+        remind_frame.pack(fill=tk.X, padx=16, pady=(0, 10))
+        remind_var = tk.BooleanVar(value=False)
+        remind_cb = tk.Checkbutton(
+            remind_frame,
+            text="同时提醒我",
+            variable=remind_var,
+            bg=panel_bg,
+            fg=text_fg,
+            activebackground=panel_bg,
+            activeforeground=text_fg,
+            selectcolor=panel_bg,
+            font=("Microsoft YaHei", 10, "bold"),
+        )
+        remind_cb.pack(side=tk.LEFT)
+
+        tk.Label(remind_frame, text="提前", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 9)).pack(side=tk.LEFT, padx=(12, 4))
+        advance_labels = [label for label, _ in REMINDER_ADVANCE_OPTIONS]
+        advance_var = tk.StringVar(value="准时")
+        advance_combo = ttk.Combobox(
+            remind_frame,
+            textvariable=advance_var,
+            values=advance_labels,
+            width=10,
+            state="readonly",
+            font=("Microsoft YaHei", 9),
+        )
+        advance_combo.pack(side=tk.LEFT)
+
+        def save():
+            content = content_entry.get("1.0", tk.END).strip()
+            if not content:
+                messagebox.showwarning("内容为空", "请输入日程内容", parent=dialog)
+                return
+
+            hour = hour_var.get()
+            minute = minute_var.get()
+            try:
+                hour_int = int(hour)
+                minute_int = int(minute)
+            except ValueError:
+                messagebox.showwarning("格式错误", "时间选择无效", parent=dialog)
+                return
+            if hour and minute:
+                item = f"{hour}:{minute} {content}"
+            else:
+                item = content
+
+            reminder_to_add = None
+            if remind_var.get():
+                remind_dt = datetime(year, month, day, hour_int, minute_int)
+                advance_minutes = advance_label_to_minutes(advance_var.get())
+                if remind_dt < datetime.now():
+                    messagebox.showwarning("时间已过期", "日程提醒时间不能早于当前时间。", parent=dialog)
+                    return
+                if advance_minutes and remind_dt - timedelta(minutes=advance_minutes) < datetime.now():
+                    messagebox.showwarning("提前时间已过", "提前通知时间已经过去，请缩短提前量或选择更晚的日程时间。", parent=dialog)
+                    return
+                reminder_to_add = {
+                    "type": "once",
+                    "year": year,
+                    "month": month,
+                    "day": day,
+                    "hour": hour_int,
+                    "minute": minute_int,
+                    "message": content,
+                    "advance_minutes": advance_minutes,
+                    "enabled": True,
+                    "last_triggered": None,
+                    "is_lunar": False,
+                    "source": "schedule",
+                    "schedule_date": date_key,
+                    "schedule_item": item,
+                }
+
+            if date_key not in self.schedules or not isinstance(self.schedules.get(date_key), list):
+                self.schedules[date_key] = []
+            if is_editing:
+                if not 0 <= edit_index < len(self.schedules[date_key]):
+                    messagebox.showwarning("保存失败", "这条日程已经不存在。", parent=dialog)
+                    return
+                self.schedules[date_key][edit_index] = item
+            else:
+                self.schedules[date_key].append(item)
+            if reminder_to_add is not None:
+                self.reminders.append(reminder_to_add)
+                self.remind_count.config(text=f"提醒({len(self.reminders)})")
+            if not self.auto_save():
+                action = "修改" if is_editing else "添加"
+                messagebox.showwarning("保存失败", f"日程已{action}，但写入文件失败，重启后可能丢失。", parent=dialog)
+            self.build_calendar()
+            dialog.destroy()
+            if return_to_list:
+                self.show_schedules()
+
+        button_bar = tk.Frame(form, bg=panel_bg)
+        button_bar.pack(fill=tk.X, padx=16, pady=(0, 14))
+
+        def make_dialog_button(parent, text, bg, fg, command, hover_bg):
+            btn = tk.Label(
+                parent,
+                text=text,
+                bg=bg,
+                fg=fg,
+                font=("Microsoft YaHei", 10, "bold"),
+                padx=22,
+                pady=7,
+                cursor="hand2",
+            )
+            btn.bind("<Button-1>", lambda e: command())
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover_bg))
+            btn.bind("<Leave>", lambda e, b=btn, normal=bg: b.config(bg=normal))
+            return btn
+
+        cancel_btn = make_dialog_button(button_bar, "取消", "#ECEFF1", "#455A64",
+                                        dialog.destroy, "#DDE3EA")
+        cancel_btn.pack(side=tk.LEFT)
+        save_btn = make_dialog_button(button_bar, "保存" if is_editing else "添加", accent, "#FFFFFF",
+                                      save, primary_hover)
+        save_btn.pack(side=tk.RIGHT)
+        dialog.bind("<Control-Return>", lambda e: save())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.after(80, content_entry.focus_set)
+
+    def set_reminder(self, event=None, prefill=None, edit_index=None):
+        editing_reminder = None
+        if edit_index is not None:
+            if 0 <= edit_index < len(self.reminders):
+                editing_reminder = dict(self.reminders[edit_index])
+            else:
+                messagebox.showwarning("编辑失败", "这条提醒已经不存在。")
+                return
+        is_editing = editing_reminder is not None
+        current_enabled = reminder_is_enabled(editing_reminder) if editing_reminder else True
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑提醒" if is_editing else "设置提醒")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.attributes("-topmost", True)
+
+        x = self.root.winfo_x() + 10
+        y = self.root.winfo_y() + 40
+        dialog.geometry(f"440x585+{x}+{y}")
+        dialog.resizable(False, False)
+        theme = self.get_theme()
+        accent = theme.get("today", "#1976D2")
+        primary_hover = {
+            "#FF9800": "#F57C00",
+            "#2E7D32": "#1B5E20",
+            "#1565C0": "#0D47A1",
+            "#C2185B": "#880E4F",
+            "#6A1B9A": "#4A148C",
+            "#1976D2": "#0D47A1",
+        }.get(accent.upper(), "#0D47A1")
+        dialog_bg = "#EEF2F7"
+        panel_bg = "#FFFFFF"
+        text_fg = "#263238"
+        muted_fg = "#607D8B"
+        field_bg = "#F8FAFC"
+        dialog.config(bg=dialog_bg)
+
+        header = tk.Frame(dialog, bg=accent)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text="编辑提醒" if is_editing else "添加提醒",
+            bg=accent,
+            fg="#FFFFFF",
+            font=("Microsoft YaHei", 14, "bold"),
+            anchor="w",
+        ).pack(fill=tk.X, padx=18, pady=(14, 1))
+        tk.Label(
+            header,
+            text="修改后会重新计算提醒时间" if is_editing else "选择提醒周期、时间和内容",
+            bg=accent,
+            fg="#F5F7FA",
+            font=("Microsoft YaHei", 9),
+            anchor="w",
+        ).pack(fill=tk.X, padx=18, pady=(0, 12))
+
+        form = tk.Frame(dialog, bg=panel_bg, highlightbackground="#DDE3EA", highlightthickness=1)
+        form.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        def style_form_widgets(parent):
+            for child in parent.winfo_children():
+                if isinstance(child, tk.Frame):
+                    child.config(bg=panel_bg)
+                    style_form_widgets(child)
+                elif isinstance(child, tk.Label):
+                    child.config(bg=panel_bg)
+                elif isinstance(child, tk.Checkbutton):
+                    child.config(
+                        bg=panel_bg,
+                        fg=text_fg,
+                        activebackground=panel_bg,
+                        activeforeground=text_fg,
+                        selectcolor=panel_bg,
+                    )
+                elif isinstance(child, tk.Text):
+                    child.config(
+                        bg=field_bg,
+                        fg=text_fg,
+                        relief=tk.FLAT,
+                        highlightbackground="#CBD5E1",
+                        highlightcolor=accent,
+                        highlightthickness=1,
+                        padx=8,
+                        pady=6,
+                    )
 
         now = datetime.now()
         prefill_year = prefill[0] if prefill else now.year
         prefill_month = prefill[1] if prefill else now.month
         prefill_day = prefill[2] if prefill else now.day
+        reminder_type = editing_reminder.get("type") if editing_reminder else None
+        if editing_reminder and reminder_type == "once":
+            prefill_year = safe_int(editing_reminder.get("year"), prefill_year)
+            prefill_month = safe_int(editing_reminder.get("month"), prefill_month)
+            prefill_day = safe_int(editing_reminder.get("day"), prefill_day)
 
         # 将预填的公历日期转为农历（用于农历类型的默认值）
         prefill_lunar_month = now.month
@@ -1809,26 +2860,51 @@ class StickyNote:
                     prefill_lunar_day = int(lunar_obj.lunarDay)
                 except Exception:
                     pass
+        if editing_reminder:
+            if reminder_type == "lunar_yearly":
+                prefill_lunar_month = safe_int(editing_reminder.get("lunar_month"), prefill_lunar_month)
+                prefill_lunar_day = safe_int(editing_reminder.get("lunar_day"), prefill_lunar_day)
+            elif reminder_type == "lunar_monthly":
+                prefill_lunar_day = safe_int(editing_reminder.get("lunar_day"), prefill_lunar_day)
+            elif reminder_type == "once" and editing_reminder.get("is_lunar"):
+                prefill_lunar_month = safe_int(editing_reminder.get("month"), prefill_lunar_month)
+                prefill_lunar_day = safe_int(editing_reminder.get("day"), prefill_lunar_day)
 
         # 类型 + 农历选择
-        top_frame = tk.Frame(dialog)
-        top_frame.pack(pady=6)
+        top_frame = tk.Frame(form, bg=panel_bg)
+        top_frame.pack(fill=tk.X, padx=16, pady=(14, 7))
 
-        tk.Label(top_frame, text="类型:", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        type_var = tk.StringVar(value="单次")
+        tk.Label(top_frame, text="提醒类型", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
 
         # 农历类型需要 zhdate
         all_types = ["单次", "每天", "每周", "每月", "每年", "每年农历", "每月农历"]
         if not ZHDATE_OK:
             all_types = ["单次", "每天", "每周", "每月", "每年"]
+        type_labels = {
+            "once": "单次",
+            "daily": "每天",
+            "weekly": "每周",
+            "monthly": "每月",
+            "yearly": "每年",
+            "lunar_yearly": "每年农历",
+            "lunar_monthly": "每月农历",
+        }
+        initial_type = type_labels.get(reminder_type, "单次")
+        if initial_type not in all_types:
+            initial_type = "单次"
+        type_var = tk.StringVar(value=initial_type)
 
         type_combo = ttk.Combobox(top_frame, textvariable=type_var, values=all_types,
                                    width=10, state="readonly", font=("Microsoft YaHei", 10))
         type_combo.pack(side=tk.LEFT, padx=4)
 
         # 动态区域容器
-        dynamic_frame = tk.Frame(dialog)
-        dynamic_frame.pack(pady=4)
+        dynamic_label = tk.Label(form, text="日期 / 周期", bg=panel_bg, fg=muted_fg,
+                                 font=("Microsoft YaHei", 9, "bold"), anchor="w")
+        dynamic_label.pack(fill=tk.X, padx=16, pady=(2, 2))
+        dynamic_frame = tk.Frame(form, bg=panel_bg)
+        dynamic_frame.pack(fill=tk.X, padx=16, pady=(0, 8))
 
         # 单次：年月日（下拉列表）
         date_frame = tk.Frame(dynamic_frame)
@@ -1852,7 +2928,9 @@ class StickyNote:
         day_combo.pack(side=tk.LEFT, padx=2)
 
         # 单次农历切换
-        is_lunar = tk.BooleanVar(value=False)
+        is_lunar = tk.BooleanVar(
+            value=bool(editing_reminder and reminder_type == "once" and editing_reminder.get("is_lunar"))
+        )
         lunar_cb = tk.Checkbutton(date_frame, text="农历", variable=is_lunar, font=("Microsoft YaHei", 9))
         lunar_cb.pack(side=tk.LEFT, padx=6)
         if not ZHDATE_OK:
@@ -1861,7 +2939,10 @@ class StickyNote:
         # 每周：周几选择
         weekday_frame = tk.Frame(dynamic_frame)
         tk.Label(weekday_frame, text="每周", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        weekday_var = tk.StringVar(value=WEEKDAYS[now.weekday()])
+        initial_weekday = safe_int(editing_reminder.get("weekday"), now.weekday()) if editing_reminder else now.weekday()
+        if not 0 <= initial_weekday < len(WEEKDAYS):
+            initial_weekday = now.weekday()
+        weekday_var = tk.StringVar(value=WEEKDAYS[initial_weekday])
         weekday_combo = ttk.Combobox(weekday_frame, textvariable=weekday_var, values=WEEKDAYS,
                                       width=6, state="readonly", font=("Microsoft YaHei", 10))
         weekday_combo.pack(side=tk.LEFT, padx=4)
@@ -1869,7 +2950,10 @@ class StickyNote:
         # 每月：几号选择
         monthday_frame = tk.Frame(dynamic_frame)
         tk.Label(monthday_frame, text="每月", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        monthday_var = tk.StringVar(value=str(now.day))
+        initial_month_day = now.day
+        if editing_reminder:
+            initial_month_day = safe_int(editing_reminder.get("day"), safe_int(editing_reminder.get("monthly_day"), now.day))
+        monthday_var = tk.StringVar(value=str(initial_month_day))
         monthday_combo = ttk.Combobox(monthday_frame, textvariable=monthday_var,
                                        values=[str(i) for i in range(1, 32)],
                                        width=6, state="readonly", font=("Microsoft YaHei", 10))
@@ -1879,13 +2963,24 @@ class StickyNote:
         # 每年（公历）：月 + 日
         yearly_frame = tk.Frame(dynamic_frame)
         tk.Label(yearly_frame, text="每年", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        yearly_month_var = tk.StringVar(value=str(prefill_month))
+        initial_yearly_month = prefill_month
+        initial_yearly_day = prefill_day
+        if editing_reminder:
+            initial_yearly_month = safe_int(
+                editing_reminder.get("month"),
+                safe_int(editing_reminder.get("yearly_month"), prefill_month),
+            )
+            initial_yearly_day = safe_int(
+                editing_reminder.get("day"),
+                safe_int(editing_reminder.get("yearly_day"), prefill_day),
+            )
+        yearly_month_var = tk.StringVar(value=str(initial_yearly_month))
         yearly_month_combo = ttk.Combobox(yearly_frame, textvariable=yearly_month_var,
                                            values=[str(i) for i in range(1, 13)],
                                            width=4, state="readonly", font=("Microsoft YaHei", 10))
         yearly_month_combo.pack(side=tk.LEFT, padx=2)
         tk.Label(yearly_frame, text="月", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        yearly_day_var = tk.StringVar(value=str(prefill_day))
+        yearly_day_var = tk.StringVar(value=str(initial_yearly_day))
         yearly_day_combo = ttk.Combobox(yearly_frame, textvariable=yearly_day_var,
                                          values=[str(i) for i in range(1, 32)],
                                          width=4, state="readonly", font=("Microsoft YaHei", 10))
@@ -1919,7 +3014,7 @@ class StickyNote:
         tk.Label(lunar_monthly_frame, text="日", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
 
         # 默认显示日期输入
-        date_frame.pack()
+        # 初始显示由 on_type_change 根据当前类型处理。
 
         def on_type_change(*args):
             # 隐藏所有动态控件
@@ -1945,31 +3040,74 @@ class StickyNote:
             # 每天不需要额外输入
 
         type_var.trace("w", on_type_change)
+        on_type_change()
 
         # 时间选择器（下拉列表）
-        time_frame = tk.Frame(dialog)
-        time_frame.pack(pady=6)
-        tk.Label(time_frame, text="时间", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        hour_var = tk.StringVar(value=f"{now.hour:02d}")
+        time_frame = tk.Frame(form, bg=panel_bg)
+        time_frame.pack(fill=tk.X, padx=16, pady=(4, 8))
+        tk.Label(time_frame, text="提醒时间", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+        initial_hour = safe_int(editing_reminder.get("hour"), now.hour) if editing_reminder else now.hour
+        initial_minute = safe_int(editing_reminder.get("minute"), now.minute) if editing_reminder else now.minute
+        hour_var = tk.StringVar(value=f"{initial_hour:02d}")
         hour_combo = ttk.Combobox(time_frame, textvariable=hour_var,
                                   values=[f"{h:02d}" for h in range(0, 24)],
                                   width=4, state="readonly", font=("Microsoft YaHei", 10))
         hour_combo.pack(side=tk.LEFT, padx=2)
         tk.Label(time_frame, text=":", font=("Microsoft YaHei", 10)).pack(side=tk.LEFT)
-        minute_var = tk.StringVar(value=f"{now.minute:02d}")
+        minute_var = tk.StringVar(value=f"{initial_minute:02d}")
         minute_combo = ttk.Combobox(time_frame, textvariable=minute_var,
                                     values=[f"{m:02d}" for m in range(0, 60)],
                                     width=4, state="readonly", font=("Microsoft YaHei", 10))
         minute_combo.pack(side=tk.LEFT, padx=2)
 
+        advance_frame = tk.Frame(form, bg=panel_bg)
+        advance_frame.pack(fill=tk.X, padx=16, pady=(0, 8))
+        tk.Label(advance_frame, text="提前通知", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+        advance_labels = [label for label, _ in REMINDER_ADVANCE_OPTIONS]
+        initial_advance = get_advance_minutes(editing_reminder) if editing_reminder else 0
+        initial_advance_label = advance_minutes_to_label(initial_advance)
+        if initial_advance_label not in advance_labels:
+            advance_labels.append(initial_advance_label)
+        advance_var = tk.StringVar(value=initial_advance_label)
+        advance_combo = ttk.Combobox(
+            advance_frame,
+            textvariable=advance_var,
+            values=advance_labels,
+            width=12,
+            state="readonly",
+            font=("Microsoft YaHei", 10),
+        )
+        advance_combo.pack(side=tk.LEFT)
+
         # 提醒内容（多行）
-        tk.Label(dialog, text="提醒内容:", font=("Microsoft YaHei", 10)).pack(pady=(6, 2))
-        msg_entry = tk.Text(dialog, font=("Microsoft YaHei", 11), width=26, height=3, wrap=tk.WORD)
-        msg_entry.pack(pady=2)
+        tk.Label(form, text="提醒内容", bg=panel_bg, fg=muted_fg,
+                 font=("Microsoft YaHei", 10, "bold"), anchor="w").pack(fill=tk.X, padx=16, pady=(0, 4))
+        msg_entry = tk.Text(form, font=("Microsoft YaHei", 11), width=38, height=3, wrap=tk.WORD)
+        msg_entry.pack(fill=tk.X, padx=16, pady=(0, 6))
+        if editing_reminder:
+            msg_entry.insert("1.0", editing_reminder.get("message", ""))
+
+        sync_schedule_frame = tk.Frame(form, bg=panel_bg)
+        sync_schedule_frame.pack(fill=tk.X, padx=16, pady=(0, 6))
+        sync_schedule_var = tk.BooleanVar(value=False)
+        sync_schedule_cb = tk.Checkbutton(
+            sync_schedule_frame,
+            text="同步到日程",
+            variable=sync_schedule_var,
+            bg=panel_bg,
+            fg=text_fg,
+            activebackground=panel_bg,
+            activeforeground=text_fg,
+            selectcolor=panel_bg,
+            font=("Microsoft YaHei", 10, "bold"),
+        )
+        sync_schedule_cb.pack(side=tk.LEFT)
 
         # 提示标签
-        hint_label = tk.Label(dialog, text="", fg="gray", font=("Microsoft YaHei", 9))
-        hint_label.pack()
+        hint_label = tk.Label(form, text="", bg=panel_bg, fg="#78909C", font=("Microsoft YaHei", 9))
+        hint_label.pack(fill=tk.X, padx=16)
 
         def on_lunar_change(*args):
             if is_lunar.get() and type_var.get() == "单次":
@@ -1978,6 +3116,7 @@ class StickyNote:
                 hint_label.config(text="")
         is_lunar.trace("w", on_lunar_change)
         type_var.trace("w", on_lunar_change)
+        style_form_widgets(form)
 
         def save():
             try:
@@ -1996,6 +3135,8 @@ class StickyNote:
                 t = type_var.get()
                 lunar = is_lunar.get()
                 label = ""
+                new_reminder = None
+                advance_minutes = advance_label_to_minutes(advance_var.get())
 
                 if t == "单次":
                     try:
@@ -2020,189 +3161,299 @@ class StickyNote:
                     if remind_dt < datetime.now():
                         messagebox.showwarning("时间已过期", "单次提醒时间不能早于当前时间")
                         return
+                    if advance_minutes and remind_dt - timedelta(minutes=advance_minutes) < datetime.now():
+                        messagebox.showwarning("提前时间已过", "提前通知时间已经过去，请缩短提前量或选择更晚的提醒时间。")
+                        return
 
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "once",
                         "year": year, "month": month, "day": day,
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": lunar,
-                    })
+                    }
                     if lunar:
                         label = "[农历] "
 
                 elif t == "每天":
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "daily",
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": False,
-                    })
+                    }
                     label = "[每天] "
 
                 elif t == "每周":
                     wd_name = weekday_var.get()
                     wd_index = WEEKDAYS.index(wd_name)
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "weekly",
                         "weekday": wd_index,
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": False,
-                    })
+                    }
                     label = f"[每周{wd_name}] "
 
                 elif t == "每月":
                     md = int(monthday_var.get())
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "monthly",
                         "day": md,
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": False,
-                    })
+                    }
                     label = f"[每月{md}号] "
 
                 elif t == "每年":
                     ym = int(yearly_month_var.get())
                     yd = int(yearly_day_var.get())
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "yearly",
                         "month": ym,
                         "day": yd,
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": False,
-                    })
+                    }
                     label = f"[每年{ym}月{yd}日] "
 
                 elif t == "每年农历":
                     lm = int(lunar_month_var.get())
                     ld = int(lunar_day_var.get())
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "lunar_yearly",
                         "lunar_month": lm,
                         "lunar_day": ld,
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": True,
-                    })
+                    }
                     label = f"[每年农历{lm}月{ld}日] "
 
                 elif t == "每月农历":
                     ld = int(lunar_monthly_day_var.get())
-                    self.reminders.append({
+                    new_reminder = {
                         "type": "lunar_monthly",
                         "lunar_day": ld,
                         "hour": hour, "minute": minute,
                         "message": msg,
+                        "advance_minutes": advance_minutes,
+                        "enabled": current_enabled,
                         "last_triggered": None,
                         "is_lunar": True,
-                    })
+                    }
                     label = f"[每月农历{ld}日] "
 
+                if new_reminder is None:
+                    messagebox.showwarning("类型错误", "请选择有效的提醒类型")
+                    return
+                if editing_reminder:
+                    for metadata_key in ("source", "schedule_date", "schedule_item", "snooze"):
+                        if metadata_key in editing_reminder:
+                            new_reminder[metadata_key] = editing_reminder[metadata_key]
+                if is_editing:
+                    self.reminders[edit_index] = new_reminder
+                else:
+                    self.reminders.append(new_reminder)
+
+                if sync_schedule_var.get():
+                    schedule_date, _ = self.add_schedule_from_reminder(new_reminder)
+                    if not schedule_date:
+                        messagebox.showwarning("同步失败", "提醒已保存，但未能计算可写入日程的日期。")
+
                 if not self.auto_save():
-                    messagebox.showwarning("保存失败", "提醒已添加，但写入文件失败，重启后可能丢失。")
+                    action = "修改" if is_editing else "添加"
+                    messagebox.showwarning("保存失败", f"提醒已{action}，但写入文件失败，重启后可能丢失。")
                 self.remind_count.config(text=f"提醒({len(self.reminders)})")
                 self.build_calendar()
                 dialog.destroy()
+                if is_editing:
+                    self.show_reminders()
 
             except ValueError as e:
                 messagebox.showwarning("日期错误", f"日期无效: {e}")
             except Exception as e:
                 messagebox.showerror("保存失败", f"发生错误: {e}")
 
-        tk.Button(dialog, text="确定", command=save, font=("Microsoft YaHei", 10), width=10).pack(pady=8)
+        button_bar = tk.Frame(form, bg=panel_bg)
+        button_bar.pack(fill=tk.X, padx=16, pady=(8, 14))
+
+        def make_dialog_button(parent, text, bg, fg, command, hover_bg):
+            btn = tk.Label(
+                parent,
+                text=text,
+                bg=bg,
+                fg=fg,
+                font=("Microsoft YaHei", 10, "bold"),
+                padx=22,
+                pady=7,
+                cursor="hand2",
+            )
+            btn.bind("<Button-1>", lambda e: command())
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg=hover_bg))
+            btn.bind("<Leave>", lambda e, b=btn, normal=bg: b.config(bg=normal))
+            return btn
+
+        cancel_btn = make_dialog_button(
+            button_bar,
+            "取消",
+            "#ECEFF1",
+            "#455A64",
+            dialog.destroy,
+            "#DDE3EA",
+        )
+        cancel_btn.pack(side=tk.LEFT)
+
+        save_btn = make_dialog_button(
+            button_bar,
+            "保存" if is_editing else "添加",
+            accent,
+            "#FFFFFF",
+            save,
+            primary_hover,
+        )
+        save_btn.pack(side=tk.RIGHT)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.after(80, msg_entry.focus_set)
+
+    def should_trigger_reminder_now(self, reminder, now):
+        if not reminder_is_enabled(reminder):
+            return False, 0, 0, None, None, 0
+        hour = safe_int(reminder.get("hour"), 0)
+        minute = safe_int(reminder.get("minute"), 0)
+        advance_minutes = get_advance_minutes(reminder)
+        reminder_type = reminder.get("type", "once")
+        days_ahead = max(3, advance_minutes // (24 * 60) + 3)
+
+        for day_offset in range(-1, days_ahead + 1):
+            candidate_date = now.date() + timedelta(days=day_offset)
+            candidate_dt = datetime(candidate_date.year, candidate_date.month, candidate_date.day)
+
+            if reminder_type == "daily":
+                matches_date = True
+            else:
+                lunar_year, lunar_month, lunar_day = self.get_lunar_parts_for_date(candidate_dt)
+                matches_date = self.reminder_matches_date(
+                    reminder,
+                    candidate_dt,
+                    lunar_year,
+                    lunar_month,
+                    lunar_day,
+                )
+            if not matches_date:
+                continue
+
+            try:
+                scheduled_time = candidate_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            except ValueError:
+                continue
+
+            trigger_time = scheduled_time - timedelta(minutes=advance_minutes)
+            # 5 秒轮询配合 90 秒触发窗口，避免在当前分钟内新增提醒后被整分钟检查漏掉。
+            seconds_after_trigger = (now - trigger_time).total_seconds()
+            if 0 <= seconds_after_trigger < 90:
+                trigger_key = f"{reminder_type}|{scheduled_time.strftime('%Y-%m-%d %H:%M')}|{advance_minutes}"
+                return True, hour, minute, trigger_key, scheduled_time, advance_minutes
+
+        return False, hour, minute, None, None, advance_minutes
+
+    def format_popup_time(self, scheduled_time, advance_minutes):
+        if scheduled_time is None:
+            return ""
+        today = datetime.now().date()
+        if scheduled_time.date() == today:
+            base = scheduled_time.strftime("%H:%M")
+        else:
+            base = scheduled_time.strftime("%m/%d %H:%M")
+        if advance_minutes:
+            return f"{base}（{advance_minutes_to_label(advance_minutes)}）"
+        return base
+
+    def add_snooze_reminder(self, message, minutes):
+        now = datetime.now()
+        snooze_time = now + timedelta(minutes=minutes)
+        snooze_time = snooze_time.replace(second=0, microsecond=0)
+        if snooze_time <= now:
+            snooze_time += timedelta(minutes=1)
+        self.reminders.append({
+            "type": "once",
+            "year": snooze_time.year,
+            "month": snooze_time.month,
+            "day": snooze_time.day,
+            "hour": snooze_time.hour,
+            "minute": snooze_time.minute,
+            "message": message,
+            "advance_minutes": 0,
+            "enabled": True,
+            "last_triggered": None,
+            "last_triggered_key": None,
+            "is_lunar": False,
+            "snooze": True,
+        })
+        self.auto_save()
+        self.remind_count.config(text=f"提醒({len(self.reminders)})")
+        self.build_calendar()
 
     def start_reminder_thread(self):
         def check():
             # 先等待一小段时间，避免启动时大量弹窗
-            time.sleep(5)
+            time.sleep(1)
             while True:
                 now = datetime.now()
                 today_str = now.strftime("%Y-%m-%d")
 
-                for r in self.reminders:
-                    if r.get("last_triggered") == today_str:
-                        continue
-
-                    hour = r.get("hour", 0)
-                    minute = r.get("minute", 0)
-
-                    # 精确匹配当前分钟
-                    if now.hour != hour or now.minute != minute:
-                        continue
-
-                    should_trigger = False
+                for r in list(self.reminders):
                     t = r.get("type", "once")
-
-                    if t == "once":
-                        dt = datetime(r["year"], r["month"], r["day"], hour, minute)
-                        if dt.date() == now.date():
-                            should_trigger = True
-                            r["done"] = True
-                    elif t == "daily":
-                        should_trigger = True
-                    elif t == "weekly":
-                        if now.weekday() == r.get("weekday", 0):
-                            should_trigger = True
-                    elif t == "monthly":
-                        if now.day == r.get("day", 1):
-                            should_trigger = True
-                    elif t == "yearly":
-                        if now.month == r.get("month") and now.day == r.get("day"):
-                            should_trigger = True
-                    elif t == "lunar_yearly":
-                        if ZHDATE_OK:
-                            try:
-                                today_lunar = ZhDate.from_datetime(now)
-                                if (today_lunar.lunar_month == r.get("lunar_month") and
-                                        today_lunar.lunar_day == r.get("lunar_day")):
-                                    should_trigger = True
-                            except Exception:
-                                pass
-                        elif CNLUNAR_OK:
-                            try:
-                                today_lunar = cnlunar.Lunar(now)
-                                if (int(today_lunar.lunarMonth) == r.get("lunar_month") and
-                                        int(today_lunar.lunarDay) == r.get("lunar_day")):
-                                    should_trigger = True
-                            except Exception:
-                                pass
-                    elif t == "lunar_monthly":
-                        if ZHDATE_OK:
-                            try:
-                                today_lunar = ZhDate.from_datetime(now)
-                                if today_lunar.lunar_day == r.get("lunar_day"):
-                                    should_trigger = True
-                            except Exception:
-                                pass
-                        elif CNLUNAR_OK:
-                            try:
-                                today_lunar = cnlunar.Lunar(now)
-                                if int(today_lunar.lunarDay) == r.get("lunar_day"):
-                                    should_trigger = True
-                            except Exception:
-                                pass
+                    (
+                        should_trigger,
+                        hour,
+                        minute,
+                        trigger_key,
+                        scheduled_time,
+                        advance_minutes,
+                    ) = self.should_trigger_reminder_now(r, now)
 
                     if should_trigger:
+                        if r.get("last_triggered_key") == trigger_key:
+                            continue
+                        if not r.get("last_triggered_key") and not advance_minutes and r.get("last_triggered") == today_str:
+                            continue
+                        if t == "once":
+                            r["done"] = True
                         r["last_triggered"] = today_str
+                        r["last_triggered_key"] = trigger_key
+                        self.data["reminders"] = self.reminders
                         self.save_data()
-                        title = "⭐ 农历提醒" if r.get("is_lunar") else "🔔 提醒"
+                        if advance_minutes:
+                            title = "⏰ 提前提醒"
+                        else:
+                            title = "⭐ 农历提醒" if r.get("is_lunar") else "🔔 提醒"
                         msg = r["message"]
-                        time_str = f"{hour:02d}:{minute:02d}"
+                        time_str = self.format_popup_time(scheduled_time, advance_minutes)
                         self.root.after(0, lambda t=title, m=msg, ts=time_str: self._show_reminder_popup(t, m, ts))
 
-                # 对齐到下一个整分钟
-                now = datetime.now()
-                sleep_seconds = 60 - now.second + 1
-                time.sleep(max(1, sleep_seconds))
+                time.sleep(5)
         threading.Thread(target=check, daemon=True).start()
 
     def _show_reminder_popup(self, title, message, time_str):
@@ -2217,10 +3468,12 @@ class StickyNote:
         popup.update_idletasks()
         sw = popup.winfo_screenwidth()
         sh = popup.winfo_screenheight()
-        w, h = 340, 200
+        w, h = 380, 260
         x = (sw - w) // 2
         y = (sh - h) // 2
         popup.geometry(f"{w}x{h}+{x}+{y}")
+        popup.lift()
+        popup.focus_force()
 
         # 主容器带圆角效果（用 Frame 模拟）
         main_bg = "#FFFFFF"
@@ -2250,18 +3503,32 @@ class StickyNote:
 
         # 消息内容
         tk.Label(container, text=message, bg=main_bg, fg="#333333",
-                 font=("Microsoft YaHei", 12), wraplength=280).pack(pady=(2, 10))
+                 font=("Microsoft YaHei", 12), wraplength=320).pack(pady=(2, 10))
+
+        def _button(parent, text, bg, fg, command, padx=16, pady=5, bold=False):
+            btn = tk.Label(parent, text=text, bg=bg, fg=fg,
+                           font=("Microsoft YaHei", 10, "bold") if bold else ("Microsoft YaHei", 9),
+                           padx=padx, pady=pady, cursor="hand2")
+            btn.bind("<Button-1>", lambda e: command())
+            btn.bind("<Enter>", lambda e, b=btn: b.config(bg="#F1F3F4" if bg != accent else ("#B71C1C" if accent == "#D32F2F" else "#F57C00")))
+            btn.bind("<Leave>", lambda e, b=btn, normal=bg: b.config(bg=normal))
+            return btn
+
+        def snooze(minutes):
+            self.add_snooze_reminder(message, minutes)
+            popup.destroy()
+
+        snooze_frame = tk.Frame(container, bg=main_bg)
+        snooze_frame.pack(pady=(0, 8))
+        _button(snooze_frame, "5分钟后", "#ECEFF1", "#455A64", lambda: snooze(5)).pack(side=tk.LEFT, padx=3)
+        _button(snooze_frame, "30分钟后", "#ECEFF1", "#455A64", lambda: snooze(30)).pack(side=tk.LEFT, padx=3)
+        _button(snooze_frame, "明天", "#ECEFF1", "#455A64", lambda: snooze(24 * 60)).pack(side=tk.LEFT, padx=3)
 
         # 按钮
         btn_frame = tk.Frame(container, bg=main_bg)
-        btn_frame.pack(pady=(0, 16))
-        btn = tk.Label(btn_frame, text="知道了", bg=accent, fg="#FFFFFF",
-                       font=("Microsoft YaHei", 11, "bold"),
-                       padx=30, pady=6, cursor="hand2")
+        btn_frame.pack(pady=(0, 14))
+        btn = _button(btn_frame, "知道了", accent, "#FFFFFF", popup.destroy, padx=30, pady=6, bold=True)
         btn.pack()
-        btn.bind("<Button-1>", lambda e: popup.destroy())
-        btn.bind("<Enter>", lambda e: btn.config(bg="#B71C1C" if accent == "#D32F2F" else "#F57C00"))
-        btn.bind("<Leave>", lambda e: btn.config(bg=accent))
 
         # 播放提示音（Windows）
         try:
@@ -2663,14 +3930,14 @@ try {
         self.time_label.config(text=now.strftime("%H:%M"))
         self.update_date_info()
 
-        # 跨天检测：日期变化时自动重建日历
-        if now.year != self.cal_year or now.month != self.cal_month:
-            self.cal_year = now.year
-            self.cal_month = now.month
+        # 跨天检测：只在日期变化时刷新，避免用户跳转月份后被每分钟拉回当前月。
+        previous_date = getattr(self, "_last_checked_date", now.date())
+        if now.date() != previous_date:
+            if self.cal_year == previous_date.year and self.cal_month == previous_date.month:
+                self.cal_year = now.year
+                self.cal_month = now.month
             self.build_calendar()
-        elif now.day != getattr(self, '_last_checked_day', now.day):
-            self.build_calendar()
-        self._last_checked_day = now.day
+        self._last_checked_date = now.date()
 
         self.root.after(60000, self.update_time)
 
